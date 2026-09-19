@@ -1,0 +1,9 @@
+# Catppuccin Frappé
+const base    = "#303446f2"
+const surface = "#414559f7"
+const text    = "#c6d0f5ff"
+const muted   = "#51576dff"
+const accent  = "#8caaeeff"
+const warning = "#e5c890ff"
+const error   = "#e78284ff"
+const border  = "#737994a0"

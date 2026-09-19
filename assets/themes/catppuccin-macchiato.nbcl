@@ -1,0 +1,9 @@
+# Catppuccin Macchiato
+const base    = "#24273af2"
+const surface = "#363a4ff7"
+const text    = "#cad3f5ff"
+const muted   = "#494d64ff"
+const accent  = "#8aadf4ff"
+const warning = "#eed49fff"
+const error   = "#ed8796ff"
+const border  = "#6e738da0"

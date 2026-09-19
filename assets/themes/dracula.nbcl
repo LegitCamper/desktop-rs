@@ -1,0 +1,9 @@
+# Dracula
+const base    = "#282a36f2"
+const surface = "#343746f7"
+const text    = "#f8f8f2ff"
+const muted   = "#44475aff"
+const accent  = "#bd93f9ff"
+const warning = "#f1fa8cff"
+const error   = "#ff5555ff"
+const border  = "#6272a4a0"

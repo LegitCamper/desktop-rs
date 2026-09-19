@@ -1,0 +1,9 @@
+# Catppuccin Latte
+const base    = "#eff1f5f2"
+const surface = "#e6e9eff7"
+const text    = "#4c4f69ff"
+const muted   = "#ccd0daff"
+const accent  = "#1e66f5ff"
+const warning = "#df8e1dff"
+const error   = "#d20f39ff"
+const border  = "#9ca0b0a0"

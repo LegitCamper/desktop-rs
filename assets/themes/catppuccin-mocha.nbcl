@@ -1,0 +1,9 @@
+# Catppuccin Mocha
+const base    = "#1e1e2ef2"
+const surface = "#313244f7"
+const text    = "#cdd6f4ff"
+const muted   = "#45475aff"
+const accent  = "#89b4faff"
+const warning = "#f9e2afff"
+const error   = "#f38ba8ff"
+const border  = "#6c7086a0"

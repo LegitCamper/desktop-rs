@@ -1,0 +1,32 @@
+[package]
+name = "desktop-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+publish = false
+
+[dependencies]
+anyhow = "1.0.100"
+cosmic-text = "0.19.0"
+freedesktop-desktop-entry = { version = "0.8.3", default-features = false }
+freedesktop-icons = "0.4.0"
+image = { version = "0.25.9", default-features = false, features = ["png"] }
+jiff = "0.2.37"
+nbcl = "0.7.7"
+resvg = { version = "0.48.1", default-features = false }
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["calloop", "xkbcommon"] }
+system-tray = { version = "0.8.9", default-features = false, features = ["data"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+xkeysym = "0.2.1"
+zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"

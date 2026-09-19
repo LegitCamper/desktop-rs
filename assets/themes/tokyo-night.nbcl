@@ -1,0 +1,9 @@
+# Tokyo Night
+const base    = "#1a1b26f2"
+const surface = "#24283bf7"
+const text    = "#c0caf5ff"
+const muted   = "#414868ff"
+const accent  = "#7aa2f7ff"
+const warning = "#e0af68ff"
+const error   = "#f7768eff"
+const border  = "#565f89a0"

@@ -1,0 +1,24 @@
+import "../themes/catppuccin-mocha.nbcl" as theme
+
+Bar {
+    height = 36 anchor = ["top", "left", "right"] layer = "top"
+    exclusive_zone = 36 background = theme.base padding = 8 align = "center"
+    Text { width = "grow" value = "desktop-rs" color = theme.text font_size = 14 }
+    Clock { width = "fit" format = "%H:%M" color = theme.text font_size = 14 }
+}
+
+Notification {
+    width = 360 height = 88 anchor = ["top", "right"] layer = "overlay"
+    margin = { top = 48 right = 12 } background = theme.surface
+    border = theme.border border_width = 1 corner_radius = 12 padding = 12
+    Text { width = "grow" value = "Notification" color = theme.text font_size = 14 }
+}
+
+Launcher {
+    width = 600 height = 280 layer = "overlay"
+    keyboard_interactivity = "exclusive" background = theme.surface
+    border = theme.border border_width = 1 corner_radius = 12 padding = 12
+    direction = "column" gap = 8
+    AppSearch { height = 34 value = "Search applications…" color = theme.text font_size = 16 }
+    AppList { height = "grow" rows = 6 color = theme.text font_size = 14 }
+}

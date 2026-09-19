@@ -1,0 +1,30 @@
+# Full example starts from the same complete configuration shipped on first run.
+# Copy assets/config.nbcl alongside themes/ to customize it.
+import "../themes/gruvbox.nbcl" as theme
+
+Bar {
+    height = 42 anchor = ["top", "left", "right"] layer = "top"
+    exclusive_zone = 42 background = theme.base padding = 8 gap = 10 align = "center"
+    Workspaces { width = "fit" color = theme.text active_color = theme.accent active_background = theme.surface urgent_color = theme.error font_size = 14 gap = 4 }
+    ActiveWindow { width = "grow" color = theme.text font_size = 14 text_align = "center" max_chars = 60 empty_value = "desktop-rs" }
+    Tray { width = "fit" color = theme.text font_size = 12 icon_size = 20 gap = 4 }
+    Audio { width = "fit" color = theme.text font_size = 14 step = 5 max_volume = 100 }
+    Clock { width = "fit" format = "%Y-%m-%d %H:%M" color = theme.text font_size = 14 }
+}
+
+Notification {
+    width = 400 height = 100 anchor = ["top", "right"] layer = "overlay"
+    margin = { top = 54 right = 12 } background = theme.surface border = theme.border
+    border_width = 1 corner_radius = 12 padding = 14 align = "center"
+    animation = { slide = "right" distance = 420 duration_ms = 220 hold_ms = 5000 }
+    Box { width = 7 background = theme.accent corner_radius = 4 }
+    Text { width = "grow" value = "Full desktop-rs example" color = theme.text font_size = 15 }
+}
+
+Launcher {
+    width = 680 height = 380 layer = "overlay" keyboard_interactivity = "exclusive"
+    background = theme.surface border = theme.border border_width = 1 corner_radius = 14
+    padding = 16 direction = "column" gap = 10
+    AppSearch { height = 44 background = theme.muted corner_radius = 8 padding = 10 value = "Search applications…" color = theme.text font_size = 17 }
+    AppList { height = "grow" rows = 7 color = theme.text font_size = 14 }
+}

@@ -1,0 +1,25 @@
+import "../themes/dracula.nbcl" as theme
+
+Bar {
+    height = 1 anchor = ["top", "left", "right"] layer = "bottom"
+    background = "#00000000"
+}
+
+Notification {
+    width = 1 height = 1 anchor = ["top", "right"] layer = "bottom"
+    background = "#00000000"
+}
+
+Launcher {
+    width = 720 height = 420 layer = "overlay" keyboard_interactivity = "exclusive"
+    background = theme.surface border = theme.border border_width = 1 corner_radius = 16
+    padding = 18 direction = "column" gap = 12
+    animation = { slide = "top" distance = 30 duration_ms = 170 }
+    AppSearch {
+        height = 48 background = theme.muted corner_radius = 9 padding = 14
+        value = "Type to search applications…" color = theme.text font_size = 17
+    }
+    AppList {
+        height = "grow" rows = 8 color = theme.text font_size = 14
+    }
+}

@@ -1,0 +1,9 @@
+# Gruvbox Dark
+const base    = "#282828f2"
+const surface = "#3c3836f7"
+const text    = "#ebdbb2ff"
+const muted   = "#504945ff"
+const accent  = "#83a598ff"
+const warning = "#fabd2fff"
+const error   = "#fb4934ff"
+const border  = "#665c54a0"
