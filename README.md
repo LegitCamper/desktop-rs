@@ -2,7 +2,7 @@
 
 Small Rust-native Linux shell/widget experiment. No GTK or Qt.
 
-Current milestone: config-driven Wayland layer-shell surfaces with software-rendered boxes/text, live clocks, interactive application launcher, compositor workspaces/focused title, PipeWire audio through `pactl`, and a StatusNotifier tray backend.
+Current milestone: config-driven Wayland layer-shell surfaces with software-rendered boxes/text, live clocks, interactive application launcher, compositor workspaces/focused title, PipeWire audio through `pactl`, a StatusNotifier tray backend, and a native `org.freedesktop.Notifications` daemon.
 
 ## Run
 
@@ -16,11 +16,51 @@ Requirements:
 
 ```sh
 cargo run -- bar           # full-width top bar with live clock
-cargo run -- notification  # slides in, holds 4s, slides out
+cargo run -- daemon        # owns org.freedesktop.Notifications, spawns popups
+cargo run -- notification  # one popup; slides in, holds, slides out
 cargo run -- launcher      # centered card with exclusive keyboard focus
 ```
 
 `bar` is default. Stop persistent surfaces with `Ctrl-C` in launching terminal. Vanilla GNOME lacks `wlr-layer-shell`; startup fails with direct protocol error there.
+
+## Compositor integration
+
+The compositor owns keybinds and autostart; desktop-rs owns everything drawn. `scripts/start.sh` starts the two long-lived processes (`daemon` and `bar`) and kills both when it stops:
+
+```
+# niri config.kdl
+spawn-at-startup "/path/to/desktop-rs/scripts/start.sh"
+binds {
+    Mod+D { spawn "desktop-rs" "launcher"; }
+}
+```
+
+```
+# hyprland.conf
+exec-once = /path/to/desktop-rs/scripts/start.sh
+bind = SUPER, D, exec, desktop-rs launcher
+```
+
+The script uses `desktop-rs` from `PATH`, falling back to `target/release/desktop-rs`; override with `DESKTOP_RS_BIN`.
+
+The launcher is one-shot: each keypress spawns a fresh process that exits on `Esc`, launch, or focus loss. No IPC socket, so nothing to keep alive.
+
+## Notifications
+
+`desktop-rs daemon` claims `org.freedesktop.Notifications` and re-executes itself as `desktop-rs notification …` per notice, one at a time. Stop `dunst`/`mako`/`swaync` first — D-Bus grants the name to one owner, and the daemon exits with `name already taken on the bus` otherwise.
+
+The `Notification` tree substitutes `{app}`, `{summary}`, and `{body}` inside any `Text` `value`:
+
+```nbcl
+Text { value = "{summary}" }
+Text { value = "{body}" }
+```
+
+A client's `expire_timeout` overrides `animation.hold_ms`; `0` (never expire) is capped at 30s so a stuck notice cannot block the queue.
+
+```sh
+notify-send "Build finished" "42 tests passed"
+```
 
 ## Config and examples
 
@@ -156,6 +196,8 @@ Omit `hold_ms` to slide in and remain visible. Moving phases use `wl_surface.fra
 - `assets/` — default config, themes, copyable examples
 - `src/platform/linux/window.rs` — layer-shell settings and templates
 - `src/platform/linux/runtime.rs` — calloop, Wayland lifecycle, timers, keyboard/pointer state
+- `src/platform/linux/notifications.rs` — `org.freedesktop.Notifications` daemon and popup queue
+- `scripts/start.sh` — compositor autostart entry for `daemon` + `bar`
 - `src/ui/element.rs` — retained element tree, row/column layout, hit testing
 - `src/ui/text.rs` — cosmic-text shaping, fallback, ellipsis, glyph rasterization
 - `src/ui/animation.rs` — slide-in/hold/slide-out timing
@@ -165,7 +207,8 @@ Omit `hold_ms` to slide in and remain visible. Moving phases use `wl_surface.fra
 ## Current limits
 
 - Scale changes trigger redraw, but true HiDPI buffer scaling is pending.
-- One process owns one surface.
+- One process owns one surface; the notification daemon works around this by re-executing itself per popup.
+- Notifications show one at a time, without actions, icons, urgency styling, or `NotificationClosed`/`ActionInvoked` signals, so `notify-send --wait` does not return early.
 - Properties use loose NBCL registration and typed conversion; unknown-property rejection is pending stable widget schemas.
 - Workspace/output association and multi-monitor filtering need broader compositor testing.
 - Audio requires `pipewire-pulse` and `pactl`; native PipeWire control is deferred until executable dependency becomes a measured problem.
@@ -175,5 +218,6 @@ Omit `hold_ms` to slide in and remain visible. Moving phases use `wl_surface.fra
 
 1. Launcher app-entry icons reusing the shared tray image pipeline.
 2. Menu item icons and nested submenu surfaces.
-3. Native notification D-Bus service, multi-surface process support, and config reload.
-4. True HiDPI buffer scaling and strict per-node NBCL schemas.
+3. Notification actions, icons, and urgency styling.
+4. Multi-surface process support and config reload.
+5. True HiDPI buffer scaling and strict per-node NBCL schemas.

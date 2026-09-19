@@ -11,7 +11,7 @@ Notification {
     width = 360 height = 88 anchor = ["top", "right"] layer = "overlay"
     margin = { top = 48 right = 12 } background = theme.surface
     border = theme.border border_width = 1 corner_radius = 12 padding = 12
-    Text { width = "grow" value = "Notification" color = theme.text font_size = 14 }
+    Text { width = "grow" value = "{summary}" color = theme.text font_size = 14 }
 }
 
 Launcher {

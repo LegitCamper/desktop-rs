@@ -18,7 +18,10 @@ Notification {
     border_width = 1 corner_radius = 12 padding = 14 align = "center"
     animation = { slide = "right" distance = 420 duration_ms = 220 hold_ms = 5000 }
     Box { width = 7 background = theme.accent corner_radius = 4 }
-    Text { width = "grow" value = "Full desktop-rs example" color = theme.text font_size = 15 }
+    Box { width = "grow" direction = "column" gap = 4
+        Text { height = "fit" value = "{summary}" color = theme.text font_size = 15 }
+        Text { height = "fit" value = "{body}" color = theme.muted font_size = 13 }
+    }
 }
 
 Launcher {
