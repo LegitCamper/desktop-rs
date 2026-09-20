@@ -5,6 +5,7 @@ use nbcl::ast::resolved::ResolvedNode;
 use nbcl::{NativeNodeSchema, NbclEngine, PropValidation, Value};
 use smithay_client_toolkit::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 
+use crate::platform::linux::audio::AudioTarget;
 use crate::platform::linux::window::{Margin, Window};
 use crate::ui::animation::{Animation, Slide};
 use crate::ui::element::{Align, Content, Direction, Element, Size, Text};
@@ -42,11 +43,17 @@ fn engine() -> NbclEngine {
         "ActiveWindow",
         "Workspaces",
         "Audio",
+        "Battery",
+        "Backlight",
+        "Network",
+        "Bluetooth",
+        "Custom",
+        "Icon",
         "Tray",
     ]) {
         engine.register_node(NativeNodeSchema {
             type_name: type_name.to_owned(),
-            enforce_id: false,
+            enforce_id: type_name == "Custom",
             // ponytail: props are checked when read, not declared per node.
             // Swap in PropValidation::Strict once the prop set stops moving.
             validation: PropValidation::Loose,
@@ -118,6 +125,8 @@ fn element(node: &ResolvedNode, fallback: Style) -> Result<Element> {
                 .unwrap_or(Color::rgba(0xff, 0xff, 0xff, 0x26)),
             text: text_style.clone(),
             rows: opt(props, "rows", int_u32)?.unwrap_or(8),
+            icon_size: opt(props, "icon_size", int_u32)?.unwrap_or(24),
+            icon_theme: opt(props, "icon_theme", text)?,
             terminal: opt(props, "terminal", string_list)?.unwrap_or_default(),
         },
         "ActiveWindow" => Content::ActiveWindow {
@@ -138,13 +147,61 @@ fn element(node: &ResolvedNode, fallback: Style) -> Result<Element> {
             },
             urgent_background: opt(props, "urgent_background", color)?
                 .unwrap_or(Color::rgba(0xff, 0x55, 0x55, 0x33)),
+            labels: opt(props, "labels", string_list)?.unwrap_or_default(),
             gap: opt(props, "gap", int_u32)?.unwrap_or(4),
             text: text_style,
         },
         "Audio" => Content::Audio {
             text: text_style,
+            target: opt(props, "target", audio_target)?.unwrap_or(AudioTarget::Sink),
+            format: opt(props, "format", text)?.unwrap_or_else(|| "{icon} {volume}%".to_owned()),
+            icon: opt(props, "icon", text)?.unwrap_or_else(|| "VOL".to_owned()),
+            muted_icon: opt(props, "muted_icon", text)?.unwrap_or_else(|| "MUTED".to_owned()),
             step: opt(props, "step", int_u32)?.unwrap_or(5),
             max_volume: opt(props, "max_volume", int_u32)?.unwrap_or(100),
+        },
+        "Battery" => Content::Battery {
+            text: text_style,
+            format: opt(props, "format", text)?.unwrap_or_else(|| "{icon} {capacity}%".to_owned()),
+            icon: opt(props, "icon", text)?.unwrap_or_else(|| "BAT".to_owned()),
+        },
+        "Backlight" => Content::Backlight {
+            text: text_style,
+            format: opt(props, "format", text)?.unwrap_or_else(|| "{icon} {percent}%".to_owned()),
+            icon: opt(props, "icon", text)?.unwrap_or_else(|| "BRT".to_owned()),
+            step: opt(props, "step", int_u32)?.unwrap_or(5),
+        },
+        "Network" => Content::Network {
+            text: text_style,
+            format: opt(props, "format", text)?
+                .unwrap_or_else(|| "{iface} {ssid} {signal}% {ipv4}/{prefix}".to_owned()),
+            disconnected_format: opt(props, "disconnected_format", text)?
+                .unwrap_or_else(|| "disconnected".to_owned()),
+            interval: opt(props, "interval", int_u32)?.unwrap_or(5),
+        },
+        "Bluetooth" => Content::Bluetooth {
+            text: text_style,
+            format: opt(props, "format", text)?.unwrap_or_else(|| "BT {connected}".to_owned()),
+            interval: opt(props, "interval", int_u32)?.unwrap_or(5),
+        },
+        "Custom" => Content::Custom {
+            text: text_style,
+            exec: opt(props, "exec", text)?.context("prop `exec` is required")?,
+            interval: opt(props, "interval", int_u32)?.unwrap_or(5),
+            format: opt(props, "format", text)?.unwrap_or_else(|| "{output}".to_owned()),
+            on_click: opt(props, "on_click", text)?,
+            on_right_click: opt(props, "on_right_click", text)?,
+            on_middle_click: opt(props, "on_middle_click", text)?,
+            on_scroll_up: opt(props, "on_scroll_up", text)?,
+            on_scroll_down: opt(props, "on_scroll_down", text)?,
+        },
+        "Icon" => Content::Icon {
+            name: opt(props, "name", text)?,
+            theme_path: None,
+            icon_theme: opt(props, "icon_theme", text)?,
+            pixmaps: Vec::new(),
+            size: opt(props, "icon_size", int_u32)?.unwrap_or(24),
+            fallback: text_style,
         },
         "Tray" => Content::Tray {
             text: text_style,
@@ -176,6 +233,7 @@ fn element(node: &ResolvedNode, fallback: Style) -> Result<Element> {
         gap: opt(props, "gap", int_u32)?.unwrap_or(0),
         direction: opt(props, "direction", direction)?.unwrap_or(Direction::Row),
         align: opt(props, "align", align)?.unwrap_or(Align::Start),
+        justify: opt(props, "justify", align)?.unwrap_or(Align::Start),
         children: node
             .children
             .iter()
@@ -245,6 +303,14 @@ fn direction(value: &Value) -> Result<Direction> {
         "row" => Ok(Direction::Row),
         "column" => Ok(Direction::Column),
         other => Err(anyhow!("expected \"row\" or \"column\", found `{other}`")),
+    }
+}
+
+fn audio_target(value: &Value) -> Result<AudioTarget> {
+    match text(value)?.as_str() {
+        "sink" => Ok(AudioTarget::Sink),
+        "source" => Ok(AudioTarget::Source),
+        other => Err(anyhow!("expected \"sink\" or \"source\", found `{other}`")),
     }
 }
 
@@ -399,7 +465,7 @@ mod tests {
         let windows = evaluate(paths::DEFAULT_CONFIG)?;
         let bar = windows.get("bar").context("config defines no bar")?;
 
-        assert_eq!(bar.root.children.len(), 5);
+        assert_eq!(bar.root.children.len(), 9);
         assert_eq!(bar.root.children[0].width, Size::Fit);
         assert_eq!(bar.root.children[1].width, Size::Grow);
         assert_eq!(bar.exclusive_zone, 40);
@@ -437,6 +503,92 @@ mod tests {
                 .with_context(|| format!("evaluate bundled theme `{name}`"))?;
             assert_eq!(windows.len(), 3);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn custom_should_require_a_unique_node_id() {
+        let source = paths::DEFAULT_CONFIG.replace(
+            "    Audio {",
+            "    Custom { exec = \"printf ok\" }\n    Audio {",
+        );
+
+        let Err(error) = evaluate(&source) else {
+            panic!("Custom without ID must fail");
+        };
+
+        assert!(error.to_string().contains("requires an #id"));
+    }
+
+    #[test]
+    fn current_dynamic_widget_subset_should_parse() -> Result<()> {
+        let source = paths::DEFAULT_CONFIG.replace(
+            "    Audio {",
+            "    Battery { width = \"fit\" format = \"{capacity}% {status}\" }\n    Backlight { width = \"fit\" }\n    Network { width = \"fit\" interval = 3 }\n    Bluetooth { width = \"fit\" }\n    Custom \"kernel\" { width = \"fit\" exec = \"uname -r\" interval = 60 on_click = \"true\" }\n    Audio { target = \"source\" format = \"{icon} {volume}%\" icon = \"MIC\" muted_icon = \"MIC OFF\"",
+        );
+
+        let windows = evaluate(&source)?;
+
+        assert_eq!(windows.get("bar").context("bar")?.root.children.len(), 14);
+        Ok(())
+    }
+
+    #[test]
+    fn app_list_should_default_icon_size_and_accept_icon_theme() -> Result<()> {
+        let source = paths::DEFAULT_CONFIG.replace(
+            "        icon_size = 24\n        icon_theme = \"hicolor\"\n",
+            "",
+        );
+        let windows = evaluate(&source)?;
+        let launcher = windows.get("launcher").context("launcher")?;
+        let list = launcher
+            .root
+            .children
+            .iter()
+            .find(|element| matches!(element.content, Content::AppList { .. }))
+            .context("AppList")?;
+
+        let Content::AppList {
+            icon_size,
+            icon_theme,
+            ..
+        } = &list.content
+        else {
+            bail!("expected AppList");
+        };
+        assert_eq!((*icon_size, icon_theme.as_deref()), (24, None));
+        Ok(())
+    }
+
+    #[test]
+    fn icon_should_keep_theme_path_and_icon_theme_separate() -> Result<()> {
+        let source = paths::DEFAULT_CONFIG.replace(
+            "    Audio {",
+            "    Icon { width = \"fit\" name = \"utilities-terminal\" icon_size = 32 icon_theme = \"Papirus\" }\n    Audio {",
+        );
+        let windows = evaluate(&source)?;
+        let icon = windows
+            .get("bar")
+            .context("bar")?
+            .root
+            .children
+            .iter()
+            .find(|element| matches!(element.content, Content::Icon { .. }))
+            .context("Icon")?;
+
+        let Content::Icon {
+            theme_path,
+            icon_theme,
+            size,
+            ..
+        } = &icon.content
+        else {
+            bail!("expected Icon");
+        };
+        assert_eq!(
+            (theme_path.as_deref(), icon_theme.as_deref(), *size),
+            (None, Some("Papirus"), 32)
+        );
         Ok(())
     }
 

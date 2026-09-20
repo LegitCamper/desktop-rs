@@ -97,7 +97,11 @@ fn hold_ms(expire_timeout: i32) -> Option<u32> {
     match expire_timeout {
         negative if negative < 0 => None,
         0 => Some(MAX_HOLD_MS),
-        millis => Some(u32::try_from(millis).unwrap_or(MAX_HOLD_MS).min(MAX_HOLD_MS)),
+        millis => Some(
+            u32::try_from(millis)
+                .unwrap_or(MAX_HOLD_MS)
+                .min(MAX_HOLD_MS),
+        ),
     }
 }
 

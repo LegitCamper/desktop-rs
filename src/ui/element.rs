@@ -1,5 +1,6 @@
 use system_tray::item::IconPixmap;
 
+use crate::platform::linux::audio::AudioTarget;
 use crate::ui::style::{Color, Style};
 
 /// Length along one axis. `Grow` splits leftover space; `Fit` uses content.
@@ -53,12 +54,14 @@ pub enum Content {
         active_background: Color,
         urgent: Text,
         urgent_background: Color,
+        labels: Vec<String>,
         gap: u32,
     },
     /// Image resolved and painted through the shared icon cache.
     Icon {
         name: Option<String>,
         theme_path: Option<String>,
+        icon_theme: Option<String>,
         pixmaps: Vec<IconPixmap>,
         size: u32,
         fallback: Text,
@@ -73,14 +76,54 @@ pub enum Content {
         selected: Text,
         select_background: Color,
         rows: u32,
+        icon_size: u32,
+        icon_theme: Option<String>,
         /// argv prefix that runs `Terminal=true` entries, e.g. `["kitty", "-e"]`.
         terminal: Vec<String>,
     },
     /// PipeWire audio volume/mute display.
     Audio {
         text: Text,
+        target: AudioTarget,
+        format: String,
+        icon: String,
+        muted_icon: String,
         step: u32,
         max_volume: u32,
+    },
+    Battery {
+        text: Text,
+        format: String,
+        icon: String,
+    },
+    Backlight {
+        text: Text,
+        format: String,
+        icon: String,
+        /// Percentage points one wheel notch moves brightness.
+        step: u32,
+    },
+    Network {
+        text: Text,
+        format: String,
+        disconnected_format: String,
+        interval: u32,
+    },
+    Bluetooth {
+        text: Text,
+        format: String,
+        interval: u32,
+    },
+    Custom {
+        text: Text,
+        exec: String,
+        interval: u32,
+        format: String,
+        on_click: Option<String>,
+        on_right_click: Option<String>,
+        on_middle_click: Option<String>,
+        on_scroll_up: Option<String>,
+        on_scroll_down: Option<String>,
     },
     /// StatusNotifier items; runtime replaces this node with live children.
     Tray {
@@ -102,6 +145,8 @@ pub struct Element {
     pub gap: u32,
     pub direction: Direction,
     pub align: Align,
+    /// Main-axis distribution of leftover space. Only bites when no child grows.
+    pub justify: Align,
     pub children: Vec<Element>,
 }
 
@@ -118,6 +163,7 @@ impl Element {
             gap: 0,
             direction: Direction::Row,
             align: Align::Start,
+            justify: Align::Start,
             children: Vec::new(),
         }
     }
@@ -204,7 +250,7 @@ fn place(
     let measured: Vec<(u32, u32)> = element
         .children
         .iter()
-        .map(|child| measure(&child.content))
+        .map(|child| natural_size(child, measure))
         .collect();
     let main_len = |index: usize, child: &Element| {
         let size = if row { child.width } else { child.height };
@@ -242,7 +288,15 @@ fn place(
         ((main - gaps - taken) / growers as f32).max(0.0)
     };
 
-    let mut offset = 0.0;
+    let mut offset = if growers == 0 {
+        match element.justify {
+            Align::Start => 0.0,
+            Align::Center => ((main - gaps - taken) / 2.0).max(0.0),
+            Align::End => (main - gaps - taken).max(0.0),
+        }
+    } else {
+        0.0
+    };
     for (index, child) in element.children.iter().enumerate() {
         let child_main = main_len(index, child).unwrap_or(share).min(main.max(0.0));
         let cross_size = if row { child.height } else { child.width };
@@ -280,6 +334,51 @@ fn place(
         place(child, child_rect, measure, items);
         offset += child_main + element.gap as f32;
     }
+}
+
+fn natural_size(element: &Element, measure: &mut impl FnMut(&Content) -> (u32, u32)) -> (u32, u32) {
+    let own = measure(&element.content);
+    if element.children.is_empty() {
+        return own;
+    }
+
+    let children = element
+        .children
+        .iter()
+        .map(|child| natural_size(child, measure))
+        .collect::<Vec<_>>();
+    let gaps = element
+        .gap
+        .saturating_mul(u32::try_from(children.len().saturating_sub(1)).unwrap_or(u32::MAX));
+    let padding = element.padding.saturating_mul(2);
+    let (content_width, content_height) = match element.direction {
+        Direction::Row => (
+            children
+                .iter()
+                .map(|(width, _)| *width)
+                .fold(gaps, u32::saturating_add),
+            children
+                .iter()
+                .map(|(_, height)| *height)
+                .max()
+                .unwrap_or_default(),
+        ),
+        Direction::Column => (
+            children
+                .iter()
+                .map(|(width, _)| *width)
+                .max()
+                .unwrap_or_default(),
+            children
+                .iter()
+                .map(|(_, height)| *height)
+                .fold(gaps, u32::saturating_add),
+        ),
+    };
+    (
+        own.0.max(content_width.saturating_add(padding)),
+        own.1.max(content_height.saturating_add(padding)),
+    )
 }
 
 /// Last named element under this point wins because children paint over parents.
@@ -344,6 +443,71 @@ mod tests {
 
         assert_eq!(items[1].rect.width, 28.0);
         assert_eq!(items[2].rect.width, 72.0);
+    }
+
+    #[test]
+    fn layout_should_measure_fit_containers_from_descendants() {
+        let tree = row(
+            vec![Element {
+                width: Size::Fit,
+                padding: 5,
+                children: vec![leaf(Size::Fit)],
+                ..Element::new(Style::panel(BG))
+            }],
+            0,
+            0,
+        );
+
+        let items = layout(&tree, 100, 30, &mut |_| (28, 12));
+
+        assert_eq!(items[1].rect.width, 38.0);
+        assert_eq!(items[2].rect.width, 28.0);
+    }
+
+    #[test]
+    fn justify_should_center_fixed_children_along_the_main_axis() {
+        let tree = Element {
+            justify: Align::Center,
+            children: vec![Element {
+                width: Size::Fixed(20),
+                ..Element::new(Style::panel(BG))
+            }],
+            ..Element::new(Style::panel(BG))
+        };
+
+        let items = layout(&tree, 100, 30, &mut zero);
+
+        assert_eq!(items[1].rect.x, 40.0);
+    }
+
+    #[test]
+    fn justify_should_push_fixed_children_to_the_end() {
+        let tree = Element {
+            justify: Align::End,
+            children: vec![Element {
+                width: Size::Fixed(20),
+                ..Element::new(Style::panel(BG))
+            }],
+            ..Element::new(Style::panel(BG))
+        };
+
+        let items = layout(&tree, 100, 30, &mut zero);
+
+        assert_eq!(items[1].rect.x, 80.0);
+    }
+
+    #[test]
+    fn justify_should_defer_to_growing_children() {
+        let tree = Element {
+            justify: Align::Center,
+            children: vec![leaf(Size::Grow)],
+            ..Element::new(Style::panel(BG))
+        };
+
+        let items = layout(&tree, 100, 30, &mut zero);
+
+        assert_eq!(items[1].rect.x, 0.0);
+        assert_eq!(items[1].rect.width, 100.0);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 Small Rust-native Linux shell/widget experiment. No GTK or Qt.
 
-Current milestone: config-driven Wayland layer-shell surfaces with software-rendered boxes/text, live clocks, interactive application launcher, compositor workspaces/focused title, PipeWire audio through `pactl`, a StatusNotifier tray backend, and a native `org.freedesktop.Notifications` daemon.
+Current milestone: config-driven Wayland layer-shell surfaces with software-rendered boxes/text/icons, live clocks and polled system status, interactive application launcher, compositor workspaces/focused title, PipeWire sink/source audio through `pactl`, NetworkManager and BlueZ through D-Bus, a StatusNotifier tray backend, and a native `org.freedesktop.Notifications` daemon.
 
 ## Run
 
@@ -12,6 +12,8 @@ Requirements:
 - Wayland session
 - compositor implementing `wlr-layer-shell` (wlroots compositors, Niri, Hyprland, and KDE Plasma)
 - `pipewire-pulse` and `pactl` for `Audio` widgets
+- NetworkManager for `Network`; BlueZ for `Bluetooth`
+- Linux power-supply and backlight sysfs for `Battery` and `Backlight`
 - `ext-workspace-v1` for `Workspaces` and `wlr-foreign-toplevel-management-v1` for `ActiveWindow`; widgets stay empty/fallback when unavailable
 
 ```sh
@@ -45,6 +47,15 @@ The script uses `desktop-rs` from `PATH`, falling back to `target/release/deskto
 
 The launcher is one-shot: each keypress spawns a fresh process that exits on `Esc`, launch, or focus loss. No IPC socket, so nothing to keep alive.
 
+Launcher input:
+
+- held keys repeat through the client-side repeat timer, so arrows and Backspace work when held
+- `Left`/`Right` move the caret; `Ctrl+A`/`Ctrl+E` jump to start/end; `Ctrl+W` deletes the word before the caret; `Ctrl+K` clears to end
+- `Home`/`End` select the first/last result, `Tab`/`Shift+Tab` and the wheel step through results
+- `Ctrl+U` and `Delete` clear the query; `Esc` or a right click exits
+
+Desktop entries whose `Exec` program cannot be resolved (missing absolute path, not on `PATH`) are dropped from the index, the same way a failing `TryExec` is. A launch that still fails shows the whole error chain, including the program, the `.desktop` path, and the OS error, and leaves the launcher open.
+
 ## Notifications
 
 `desktop-rs daemon` claims `org.freedesktop.Notifications` and re-executes itself as `desktop-rs notification …` per notice, one at a time. Stop `dunst`/`mako`/`swaync` first — D-Bus grants the name to one owner, and the daemon exits with `name already taken on the bus` otherwise.
@@ -68,6 +79,7 @@ Single entry point:
 
 - `$XDG_CONFIG_HOME/desktop-rs/config.nbcl`
 - fallback: `~/.config/desktop-rs/config.nbcl`
+- optional local fonts: `fonts/` beside `config.nbcl`
 
 First start embeds and writes complete starter bundle without network access:
 
@@ -105,7 +117,7 @@ Each exports `base`, `surface`, `text`, `muted`, `accent`, `warning`, `error`, a
 
 ## NBCL elements
 
-[NBCL](https://nbcl-lang.github.io/docs) defines all three required surfaces: `Bar`, `Notification`, and `Launcher`. Supported child nodes: `Box`, `Text`, `Clock`, `Workspaces`, `ActiveWindow`, `Audio`, `AppSearch`, and `AppList`.
+[NBCL](https://nbcl-lang.github.io/docs) defines all three required surfaces: `Bar`, `Notification`, and `Launcher`. Supported child nodes: `Box`, `Text`, `Icon`, `Clock`, `Workspaces`, `ActiveWindow`, `Audio`, `Battery`, `Backlight`, `Network`, `Bluetooth`, named `Custom`, `Tray`, `AppSearch`, and `AppList`.
 
 ```nbcl
 Bar {
@@ -151,6 +163,7 @@ Layout properties:
 - `width`, `height`: non-negative integer, `"grow"`, or `"fit"`
 - `direction`: `"row"` or `"column"`
 - `align`, `text_align`: `"start"`, `"center"`, or `"end"`
+- `justify`: `"start"`, `"center"`, or `"end"`; distributes leftover main-axis space, ignored once any child is `"grow"`
 - `padding`, `gap`: non-negative integer pixels
 
 Text properties:
@@ -164,12 +177,18 @@ Text properties:
 Dynamic widget properties:
 
 - `ActiveWindow`: `max_chars`, `empty_value`
-- `Workspaces`: `active_color`, `active_background`, `urgent_color`, `urgent_background`, `gap`
-- `Tray`: `icon_size`, `gap`; primary click activates item, secondary click opens the DBusMenu popup (falling back to a `ContextMenu` D-Bus call when the item exposes no menu), wheel scroll sends vertical `Scroll`
-- `Audio`: `step` percentage per wheel notch, `max_volume` safety ceiling; primary click toggles mute
-- `AppList`: `rows`, `terminal` argv list for `Terminal=true` entries
+- `Workspaces`: `active_color`, `active_background`, `urgent_color`, `urgent_background`, optional ordered `labels`, `gap`; primary click activates, wheel scroll moves to the next/previous visible workspace and wraps at both ends
+- `Tray`: `icon_size`, `gap`; primary click activates item, secondary click opens the DBusMenu popup (falling back to a `ContextMenu` D-Bus call when the item exposes no menu), middle click sends `SecondaryActivate`, wheel scroll sends vertical `Scroll`
+- `Audio`: `target` (`"sink"` or `"source"`), `format`, `icon`, `muted_icon`, `step`, `max_volume`; primary click toggles the selected target and wheel adjusts that target
+- `Battery`: `format`, `icon`; fields `{capacity}`, `{status}`, `{online}`, `{icon}`
+- `Backlight`: `format`, `icon`, `step` (default `5`); fields `{percent}`, `{icon}`; wheel scroll changes brightness through logind `SetBrightness`, floored at 1% so the screen cannot go fully dark
+- `Network`: `format`, `disconnected_format`, `interval`; fields `{iface}`, `{ssid}`, `{signal}`, `{ipv4}`, `{prefix}`, `{linked}`
+- `Bluetooth`: `format`, `interval`; fields `{powered}`, `{connected}`
+- `Custom "unique-id"`: required `exec`; optional `interval`, `format` (`{output}`), `on_click`, `on_right_click`, `on_middle_click`, `on_scroll_up`, `on_scroll_down`; commands run through `/bin/sh -c`, one run per pointer event regardless of wheel notch count
+- `Icon`: `name`, `icon_size`, `icon_theme`; absolute paths and named theme icons supported
+- `AppList`: `rows`, `terminal` argv list for `Terminal=true` entries, `icon_size` (default `24`), optional `icon_theme`; app discovery checks `XDG_DATA_HOME/applications` first and deduplicates lower-precedence desktop IDs
 
-Audio backend uses PipeWire through `pipewire-pulse`/`pactl`. Missing `pactl` renders `VOL --`; worker retries subscriptions without terminating bar.
+Audio backend uses PipeWire through `pipewire-pulse`/`pactl`. Missing targets hide their nodes while worker retries subscriptions. Battery and backlight read `/sys/class/power_supply` and `/sys/class/backlight`; unavailable nodes hide. Backlight *writes* go through logind's `SetBrightness`, which grants the active session access that the sysfs files themselves usually deny. NetworkManager and BlueZ use system D-Bus through `zbus`; unavailable services hide. Dynamic nodes removed at runtime collapse parent layout and gaps, while explicit empty `Box` nodes remain spacers.
 
 NBCL map literals are whitespace-separated, not comma-separated:
 
@@ -216,8 +235,7 @@ Omit `hold_ms` to slide in and remain visible. Moving phases use `wl_surface.fra
 
 ## Next milestones
 
-1. Launcher app-entry icons reusing the shared tray image pipeline.
-2. Menu item icons and nested submenu surfaces.
-3. Notification actions, icons, and urgency styling.
-4. Multi-surface process support and config reload.
-5. True HiDPI buffer scaling and strict per-node NBCL schemas.
+1. Menu item icons and nested submenu surfaces.
+2. Notification actions, icons, and urgency styling.
+3. Multi-surface process support and config reload.
+4. True HiDPI buffer scaling and strict per-node NBCL schemas.

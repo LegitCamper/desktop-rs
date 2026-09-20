@@ -17,6 +17,7 @@ pub struct Image {
 struct CacheKey {
     name: String,
     theme_path: Option<String>,
+    icon_theme: Option<String>,
     size: u32,
     scale: u32,
 }
@@ -40,27 +41,22 @@ impl ImageCache {
         &mut self,
         name: &str,
         theme_path: Option<&str>,
+        icon_theme: Option<&str>,
         size: u32,
         scale: u32,
     ) -> Option<&Image> {
         let key = CacheKey {
             name: name.to_owned(),
             theme_path: theme_path.map(str::to_owned),
+            icon_theme: icon_theme.map(str::to_owned),
             size,
             scale,
         };
-        self.images.entry(key).or_insert_with(|| {
-            resolve_named(name, theme_path, size, scale)
+        self.images.entry(key.clone()).or_insert_with(|| {
+            resolve_named(name, theme_path, icon_theme, size, scale)
                 .and_then(|path| decode_path(&path, size.saturating_mul(scale).max(1)).ok())
         });
-        self.images
-            .get(&CacheKey {
-                name: name.to_owned(),
-                theme_path: theme_path.map(str::to_owned),
-                size,
-                scale,
-            })
-            .and_then(Option::as_ref)
+        self.images.get(&key).and_then(Option::as_ref)
     }
 
     pub fn pixmap(&mut self, pixmaps: &[IconPixmap], size: u32, scale: u32) -> Option<&Image> {
@@ -71,14 +67,22 @@ impl ImageCache {
             size,
             scale,
         };
-        self.pixmaps
-            .entry(key.clone())
-            .or_insert_with(|| decode_pixmap(&key.pixmap).ok());
+        self.pixmaps.entry(key.clone()).or_insert_with(|| {
+            decode_pixmap(&key.pixmap)
+                .ok()
+                .map(|image| fit(image, target))
+        });
         self.pixmaps.get(&key).and_then(Option::as_ref)
     }
 }
 
-fn resolve_named(name: &str, theme_path: Option<&str>, size: u32, scale: u32) -> Option<PathBuf> {
+fn resolve_named(
+    name: &str,
+    theme_path: Option<&str>,
+    icon_theme: Option<&str>,
+    size: u32,
+    scale: u32,
+) -> Option<PathBuf> {
     let explicit = Path::new(name);
     if explicit.is_absolute() && explicit.is_file() {
         return Some(explicit.to_owned());
@@ -91,11 +95,13 @@ fn resolve_named(name: &str, theme_path: Option<&str>, size: u32, scale: u32) ->
             }
         }
     }
-    freedesktop_icons::lookup(name)
+    let lookup = freedesktop_icons::lookup(name)
         .with_size(u16::try_from(size).unwrap_or(u16::MAX))
-        .with_scale(u16::try_from(scale).unwrap_or(u16::MAX))
-        .with_cache()
-        .find()
+        .with_scale(u16::try_from(scale).unwrap_or(u16::MAX));
+    match icon_theme {
+        Some(icon_theme) => lookup.with_theme(icon_theme).with_cache().find(),
+        None => lookup.with_cache().find(),
+    }
 }
 
 fn decode_path(path: &Path, target: u32) -> Result<Image> {
@@ -105,13 +111,15 @@ fn decode_path(path: &Path, target: u32) -> Result<Image> {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("png") => decode_png(path, target),
+        Some("png") => decode_raster(path, target),
         Some("svg") => decode_svg(path, target),
-        _ => bail!("unsupported icon format `{}`", path.display()),
+        _ => decode_raster(path, target)
+            .or_else(|_| decode_svg(path, target))
+            .with_context(|| format!("unsupported icon format `{}`", path.display())),
     }
 }
 
-fn decode_png(path: &Path, target: u32) -> Result<Image> {
+fn decode_raster(path: &Path, target: u32) -> Result<Image> {
     let image = ImageReader::open(path)
         .with_context(|| format!("open icon `{}`", path.display()))?
         .with_guessed_format()
@@ -180,6 +188,35 @@ pub fn decode_pixmap(pixmap: &IconPixmap) -> Result<Image> {
     })
 }
 
+/// Scales already-premultiplied BGRA down to `target` when a pixmap
+/// arrives larger than the widget box. Tray icons routinely ship 256px.
+/// Triangle filtering avoids the ringing overshoot that would push a
+/// channel above its own alpha in premultiplied space.
+fn fit(image: Image, target: u32) -> Image {
+    let longest = image.width.max(image.height);
+    if longest <= target || longest == 0 {
+        return image;
+    }
+    let scale = f64::from(target) / f64::from(longest);
+    let width = ((f64::from(image.width) * scale).round() as u32).max(1);
+    let height = ((f64::from(image.height) * scale).round() as u32).max(1);
+    let Some(buffer) = image::RgbaImage::from_raw(image.width, image.height, image.pixels.clone())
+    else {
+        return image;
+    };
+    let scaled = image::imageops::resize(
+        &buffer,
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    );
+    Image {
+        width: scaled.width(),
+        height: scaled.height(),
+        pixels: scaled.into_raw(),
+    }
+}
+
 fn validate_pixels(width: u32, height: u32, pixels: &[u8]) -> Result<()> {
     let expected = usize::try_from(width)
         .ok()
@@ -209,6 +246,50 @@ fn closest_pixmap(pixmaps: &[IconPixmap], target: u32) -> Option<&IconPixmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_tray_pixmap_should_shrink_to_icon_box() {
+        let pixmap = IconPixmap {
+            width: 256,
+            height: 256,
+            pixels: vec![0xff; 256 * 256 * 4],
+        };
+        let mut cache = ImageCache::default();
+
+        let size = cache
+            .pixmap(std::slice::from_ref(&pixmap), 20, 1)
+            .map(|image| (image.width, image.height));
+
+        assert_eq!(size, Some((20, 20)));
+    }
+
+    #[test]
+    fn small_pixmap_should_not_be_upscaled() {
+        let image = fit(
+            Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0; 16 * 16 * 4],
+            },
+            64,
+        );
+
+        assert_eq!((image.width, image.height), (16, 16));
+    }
+
+    #[test]
+    fn fit_should_preserve_aspect_ratio() {
+        let image = fit(
+            Image {
+                width: 128,
+                height: 64,
+                pixels: vec![0; 128 * 64 * 4],
+            },
+            32,
+        );
+
+        assert_eq!((image.width, image.height), (32, 16));
+    }
 
     #[test]
     fn decode_pixmap_should_premultiply_network_argb_to_wayland_bgra() -> Result<()> {
@@ -250,6 +331,25 @@ mod tests {
         };
         assert_eq!(cache.pixmaps.len(), 1);
         assert!(cache.pixmaps.contains_key(&key));
+    }
+
+    #[test]
+    fn decode_path_should_sniff_extensionless_raster() -> Result<()> {
+        let target = std::env::temp_dir().join(format!(
+            "desktop-rs-extensionless-icon-{}",
+            std::process::id()
+        ));
+        let source = target.with_extension("png");
+        image::RgbaImage::from_raw(1, 1, vec![0xff, 0, 0, 0xff])
+            .context("create PNG fixture")?
+            .save_with_format(&source, image::ImageFormat::Png)?;
+        std::fs::rename(source, &target)?;
+
+        let image = decode_path(&target, 1)?;
+        std::fs::remove_file(target)?;
+
+        assert_eq!((image.width, image.height), (1, 1));
+        Ok(())
     }
 
     #[test]

@@ -8,6 +8,11 @@ pub fn entry_point() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.nbcl"))
 }
 
+/// Optional application-local fonts loaded before rendering text.
+pub fn font_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("fonts"))
+}
+
 fn config_dir() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(xdg).join("desktop-rs"));

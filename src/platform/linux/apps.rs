@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -70,7 +70,7 @@ fn parse(path: &Path, id: &str, locale: &str) -> Option<App> {
         return None;
     }
     let executable = entry.parse_exec().ok()?;
-    if executable.is_empty() {
+    if !executable.first().is_some_and(|program| available(program)) {
         return None;
     }
     Some(App {
@@ -117,18 +117,25 @@ fn matches_desktop(values: Vec<&str>) -> bool {
 }
 
 /// Only a present `TryExec` key filters an entry; the spec defines no Exec
-/// existence check, and flatpak/wrapper entries would fail one.
+/// existence check, but an `Exec` program that cannot be spawned only produces
+/// a result row that fails on Enter, so both keys are resolved the same way.
 fn try_exec(entry: &DesktopEntry) -> bool {
     match entry.try_exec().filter(|value| !value.is_empty()) {
         None => true,
-        Some(candidate) => {
-            let path = PathBuf::from(candidate);
-            if path.is_absolute() || candidate.contains('/') {
-                executable(&path)
-            } else {
-                in_path(candidate)
-            }
-        }
+        Some(candidate) => available(candidate),
+    }
+}
+
+/// True when `candidate` resolves to an executable file, by path or through `PATH`.
+fn available(candidate: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    let path = PathBuf::from(candidate);
+    if path.is_absolute() || candidate.contains('/') {
+        executable(&path)
+    } else {
+        in_path(candidate)
     }
 }
 
@@ -252,7 +259,13 @@ pub fn launch(app: &App, terminal: &[String]) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("launch `{}`", app.name))?;
+        .with_context(|| {
+            format!(
+                "launch `{}` from `{}`",
+                app.executable.join(" "),
+                app.path.display()
+            )
+        })?;
     // Desktop applications belong to the session, not this launcher. Dropping
     // the child handle after a successful spawn avoids reaping them here.
     let _ = child;
@@ -262,6 +275,8 @@ pub fn launch(app: &App, terminal: &[String]) -> Result<()> {
 /// Search state: one startup scan, then all queries search memory.
 pub struct Apps {
     query: String,
+    /// Caret offset into `query`; always on a UTF-8 character boundary.
+    caret: usize,
     selected: usize,
     /// First result drawn when the match list is taller than the window.
     scroll: usize,
@@ -300,6 +315,7 @@ impl Apps {
     fn empty() -> Self {
         Self {
             query: String::new(),
+            caret: 0,
             selected: 0,
             scroll: 0,
             visible: 8,
@@ -343,33 +359,84 @@ impl Apps {
         &self.query
     }
 
+    /// Query split at the caret, for drawing the caret inside the text.
+    pub fn query_around_caret(&self) -> (&str, &str) {
+        self.query.split_at(self.caret)
+    }
+
     pub fn set_query(&mut self, query: String) {
         self.query = query;
+        self.caret = self.query.len();
         self.sync();
     }
 
-    /// Adds typed text to the end of the query; the caret only ever trails text.
+    /// Inserts typed text at the caret and steps the caret past it.
     pub fn type_text(&mut self, text: &str) {
-        self.query.push_str(text);
+        self.query.insert_str(self.caret, text);
+        self.caret += text.len();
         self.sync();
     }
 
-    /// Drops one word with `word`, otherwise one character.
+    /// Moves the caret one character left or right; `delta` is in characters.
+    pub fn move_caret(&mut self, delta: isize) {
+        self.caret = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => self.previous_boundary(),
+            std::cmp::Ordering::Greater => self.next_boundary(),
+            std::cmp::Ordering::Equal => self.caret,
+        };
+    }
+
+    pub fn caret_to_start(&mut self) {
+        self.caret = 0;
+    }
+
+    pub fn caret_to_end(&mut self) {
+        self.caret = self.query.len();
+    }
+
+    /// Drops one word with `word`, otherwise one character, before the caret.
     pub fn backspace(&mut self, word: bool) {
-        if word {
-            let trimmed = self.query.trim_end();
-            self.query = match trimmed.rfind([' ', '\t']) {
-                Some(start) => trimmed[..start].to_owned(),
-                None => String::new(),
-            };
+        let start = if word {
+            self.word_start()
         } else {
-            self.query.pop();
-        }
+            self.previous_boundary()
+        };
+        self.query.replace_range(start..self.caret, "");
+        self.caret = start;
+        self.sync();
+    }
+
+    /// Removes everything after the caret, as Ctrl+K does.
+    pub fn delete_to_end(&mut self) {
+        self.query.truncate(self.caret);
         self.sync();
     }
 
     pub fn clear_query(&mut self) {
         self.set_query(String::new());
+    }
+
+    fn previous_boundary(&self) -> usize {
+        self.query[..self.caret]
+            .chars()
+            .next_back()
+            .map_or(0, |character| self.caret - character.len_utf8())
+    }
+
+    fn next_boundary(&self) -> usize {
+        self.query[self.caret..]
+            .chars()
+            .next()
+            .map_or(self.caret, |character| self.caret + character.len_utf8())
+    }
+
+    /// Start of the whitespace-delimited word ending at the caret.
+    fn word_start(&self) -> usize {
+        let trimmed = self.query[..self.caret].trim_end_matches(char::is_whitespace);
+        trimmed
+            .char_indices()
+            .rfind(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8())
     }
 
     /// All matches, untruncated; `selected` indexes into this list.
@@ -463,12 +530,33 @@ impl Apps {
 
 /// Desktop directories in XDG precedence order.
 pub fn default_dirs() -> Vec<PathBuf> {
-    let variable = std::env::var_os("XDG_DATA_DIRS")
+    default_dirs_from(
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+        std::env::var_os("XDG_DATA_DIRS"),
+    )
+}
+
+fn default_dirs_from(
+    data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    data_dirs: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(home) = data_home
+        .filter(|value| !value.is_empty())
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share").into_os_string()))
+    {
+        directories.push(PathBuf::from(home).join("applications"));
+    }
+    let variable = data_dirs
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-    std::env::split_paths(&variable)
-        .map(|directory| directory.join("applications"))
-        .collect()
+    directories
+        .extend(std::env::split_paths(&variable).map(|directory| directory.join("applications")));
+    let mut seen = HashSet::new();
+    directories.retain(|directory| seen.insert(directory.clone()));
+    directories
 }
 
 #[cfg(test)]
@@ -511,6 +599,23 @@ mod tests {
     }
 
     #[test]
+    fn default_dirs_should_prefer_and_deduplicate_xdg_data_home() {
+        let home = PathBuf::from("/tmp/desktop-rs-xdg-data-home");
+        let data_dirs =
+            std::env::join_paths([home.as_path(), Path::new("/two")]).unwrap_or_default();
+        let directories =
+            default_dirs_from(Some(home.clone().into_os_string()), None, Some(data_dirs));
+
+        assert_eq!(
+            directories,
+            [
+                home.join("applications"),
+                PathBuf::from("/two/applications")
+            ]
+        );
+    }
+
+    #[test]
     fn scan_should_filter_entries_and_preserve_xdg_precedence() -> Result<()> {
         let root = temp_dir("scan");
         let first = root.join("first");
@@ -518,7 +623,7 @@ mod tests {
         write(
             &first,
             "visible.desktop",
-            "[Desktop Entry]\nType=Application\nName=Visible\nExec=/bin/true\n",
+            "[Desktop Entry]\nType=Application\nName=Visible\nExec=/bin/true\nIcon=visible-icon\n",
         )?;
         write(
             &second,
@@ -544,6 +649,7 @@ mod tests {
         let apps = scan(&[first, second], "en_US");
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "Visible");
+        assert_eq!(apps[0].icon, "visible-icon");
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -569,10 +675,10 @@ mod tests {
         let path = write(
             &root,
             "editor.desktop",
-            "[Desktop Entry]\nType=Application\nName=Editor\nExec=/usr/bin/editor %U\n",
+            "[Desktop Entry]\nType=Application\nName=Editor\nExec=/bin/sh %U\n",
         )?;
         let app = parse(&path, "editor", "en_US").context("parse editor entry")?;
-        assert_eq!(app.executable, ["/usr/bin/editor".to_owned()]);
+        assert_eq!(app.executable, ["/bin/sh".to_owned()]);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -666,6 +772,95 @@ mod tests {
     }
 
     #[test]
+    fn scan_should_drop_entries_whose_exec_program_is_missing() -> Result<()> {
+        let root = temp_dir("missing-exec");
+        write(
+            &root,
+            "stale-flatpak.desktop",
+            "[Desktop Entry]\nType=Application\nName=Stale\nExec=/definitely/not/installed/flatpak run com.example.App\n",
+        )?;
+        write(
+            &root,
+            "stale-bare.desktop",
+            "[Desktop Entry]\nType=Application\nName=Bare\nExec=definitely-not-installed-desktop-rs\n",
+        )?;
+        write(
+            &root,
+            "present.desktop",
+            "[Desktop Entry]\nType=Application\nName=Present\nExec=/bin/sh -c true\n",
+        )?;
+
+        let apps = scan(std::slice::from_ref(&root), "en_US");
+        fs::remove_dir_all(root)?;
+
+        assert_eq!(
+            apps.iter().map(|app| app.name.as_str()).collect::<Vec<_>>(),
+            ["Present"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_should_report_the_program_and_desktop_entry_path() {
+        let missing = App {
+            executable: vec!["/definitely/not/installed/flatpak".to_owned(), "run".into()],
+            ..app("stale")
+        };
+
+        let Err(error) = launch(&missing, &[]) else {
+            panic!("a missing program must not report a successful launch");
+        };
+
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("/definitely/not/installed/flatpak run")
+                && chain.contains("stale.desktop")
+                && chain.contains("No such file or directory"),
+            "unexpected error chain: {chain}"
+        );
+    }
+
+    #[test]
+    fn caret_should_edit_multibyte_text_in_place() {
+        let mut apps = Apps::from_index(vec![app("Files")]);
+
+        apps.type_text("aé中b");
+        apps.move_caret(-1);
+        apps.move_caret(-1);
+        apps.type_text("X");
+        assert_eq!(apps.query(), "aéX中b");
+        assert_eq!(apps.query_around_caret(), ("aéX", "中b"));
+
+        apps.backspace(false);
+        assert_eq!(apps.query(), "aé中b");
+        apps.move_caret(1);
+        apps.move_caret(1);
+        assert_eq!(apps.query_around_caret(), ("aé中b", ""));
+        apps.move_caret(1);
+        assert_eq!(apps.query_around_caret(), ("aé中b", ""));
+    }
+
+    #[test]
+    fn caret_shortcuts_should_jump_and_delete_around_the_caret() {
+        let mut apps = Apps::from_index(vec![app("Files")]);
+
+        apps.type_text("text editor");
+        apps.caret_to_start();
+        assert_eq!(apps.query_around_caret(), ("", "text editor"));
+        apps.move_caret(-1);
+        assert_eq!(apps.query_around_caret(), ("", "text editor"));
+
+        apps.caret_to_end();
+        apps.backspace(true);
+        assert_eq!(apps.query(), "text ");
+
+        apps.type_text("editor");
+        apps.move_caret(-1);
+        apps.delete_to_end();
+        assert_eq!(apps.query(), "text edito");
+    }
+
+    #[test]
     fn backspace_should_drop_one_word_or_one_character() {
         let mut apps = Apps::from_index(vec![app("Files")]);
 
@@ -673,7 +868,7 @@ mod tests {
         apps.backspace(false);
         assert_eq!(apps.query(), "text edito");
         apps.backspace(true);
-        assert_eq!(apps.query(), "text");
+        assert_eq!(apps.query(), "text ");
         apps.backspace(true);
         assert_eq!(apps.query(), "");
         apps.clear_query();

@@ -1,9 +1,11 @@
 pub mod apps;
 pub mod audio;
+pub mod custom;
 pub mod dbus;
 pub mod notifications;
 mod runtime;
 pub mod status_notifier;
+pub mod system;
 pub mod taskbar;
 pub mod window;
 

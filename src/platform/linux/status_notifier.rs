@@ -18,6 +18,7 @@ use crate::platform::linux::runtime::BackendEvent;
 #[proxy(interface = "org.kde.StatusNotifierItem", assume_defaults = true)]
 trait NotifierItem {
     fn context_menu(&self, x: i32, y: i32) -> zbus::Result<()>;
+    fn secondary_activate(&self, x: i32, y: i32) -> zbus::Result<()>;
     fn scroll(&self, delta: i32, orientation: &str) -> zbus::Result<()>;
 }
 
@@ -139,6 +140,11 @@ enum TrayCommand {
         x: i32,
         y: i32,
     },
+    SecondaryActivate {
+        address: String,
+        x: i32,
+        y: i32,
+    },
     Scroll {
         address: String,
         delta: i32,
@@ -240,6 +246,13 @@ impl TrayClient {
             .send(TrayCommand::ContextMenu { address, x, y });
     }
 
+    /// Middle click; waybar and friends map this to `SecondaryActivate`.
+    pub fn secondary_activate(&self, address: String, x: i32, y: i32) {
+        let _ = self
+            .command_tx
+            .send(TrayCommand::SecondaryActivate { address, x, y });
+    }
+
     pub fn scroll(&self, address: String, delta: i32) {
         let _ = self.command_tx.send(TrayCommand::Scroll { address, delta });
     }
@@ -265,6 +278,7 @@ fn run_worker(
     backend_sender: CalloopSender<BackendEvent>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_io()
         .enable_time()
         .build()
     {
@@ -394,6 +408,11 @@ async fn activate(
             .context_menu(x, y)
             .await
             .context("open StatusNotifier context menu"),
+        TrayCommand::SecondaryActivate { address, x, y } => notifier_proxy(connection, address)
+            .await?
+            .secondary_activate(x, y)
+            .await
+            .context("secondary activate StatusNotifier item"),
         TrayCommand::Scroll { address, delta } => notifier_proxy(connection, address)
             .await?
             .scroll(delta, "vertical")

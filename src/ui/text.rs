@@ -15,8 +15,14 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     pub fn new() -> Self {
+        let mut fonts = FontSystem::new();
+        if let Ok(directory) = crate::config::paths::font_dir()
+            && directory.is_dir()
+        {
+            fonts.db_mut().load_fonts_dir(directory);
+        }
         Self {
-            fonts: FontSystem::new(),
+            fonts,
             glyphs: SwashCache::new(),
         }
     }
@@ -116,6 +122,11 @@ fn resolved_text(content: &Content) -> Result<Option<Text>> {
         | Content::ActiveWindow { .. }
         | Content::Workspaces { .. }
         | Content::Audio { .. }
+        | Content::Battery { .. }
+        | Content::Backlight { .. }
+        | Content::Network { .. }
+        | Content::Bluetooth { .. }
+        | Content::Custom { .. }
         | Content::Tray { .. } => Ok(None),
         Content::Text(text) => Ok(Some(text.clone())),
         Content::Clock { text, format } => {

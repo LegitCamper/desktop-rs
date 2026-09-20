@@ -121,9 +121,11 @@ impl WorkspaceReducer {
             .cloned()
             .collect();
 
+        // Coordinates are N-dimensional (`[group, index]` on Niri); compare the
+        // whole tuple so the trailing position axis actually orders the list.
         list.sort_by(
-            |left, right| match (left.coordinates.first(), right.coordinates.first()) {
-                (Some(a), Some(b)) if a != b => a.cmp(b),
+            |left, right| match (&left.coordinates, &right.coordinates) {
+                (a, b) if !a.is_empty() && !b.is_empty() && a != b => a.cmp(b),
                 _ => {
                     let left_num = left.name.parse::<u32>().ok();
                     let right_num = right.name.parse::<u32>().ok();
@@ -430,15 +432,15 @@ mod tests {
 
         reducer.workspace_created("ws_1".into());
         reducer.set_name("ws_1", "10".into());
-        reducer.set_coordinates("ws_1", vec![2]);
+        reducer.set_coordinates("ws_1", vec![0, 2]);
 
         reducer.workspace_created("ws_2".into());
         reducer.set_name("ws_2", "2".into());
-        reducer.set_coordinates("ws_2", vec![1]);
+        reducer.set_coordinates("ws_2", vec![0, 1]);
 
         reducer.workspace_created("ws_3".into());
         reducer.set_name("ws_3", "1".into());
-        reducer.set_coordinates("ws_3", vec![1]); // tie-break by name "1" < "2"
+        reducer.set_coordinates("ws_3", vec![0, 1]); // tie-break by name "1" < "2"
 
         reducer.workspace_created("ws_hidden".into());
         reducer.set_name("ws_hidden", "hidden".into());

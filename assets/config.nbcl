@@ -51,10 +51,43 @@ Bar {
     }
     Audio {
         width      = "fit"
+        target     = "sink"
+        format     = "{icon} {volume}%"
+        icon       = "VOL"
+        muted_icon = "MUTED"
         color      = theme.text
         font_size  = 14
         step       = 5
         max_volume = 100
+    }
+    Battery {
+        width     = "fit"
+        format    = "{icon} {capacity}%"
+        icon      = "BAT"
+        color     = theme.text
+        font_size = 14
+    }
+    Backlight {
+        width     = "fit"
+        format    = "{icon} {percent}%"
+        icon      = "BRT"
+        color     = theme.text
+        font_size = 14
+    }
+    Network {
+        width               = "fit"
+        format              = "{iface} {ssid} {signal}% {ipv4}/{prefix}"
+        disconnected_format = "disconnected"
+        interval            = 5
+        color               = theme.text
+        font_size           = 14
+    }
+    Bluetooth {
+        width     = "fit"
+        format    = "BT {connected}"
+        interval  = 5
+        color     = theme.text
+        font_size = 14
     }
     Clock {
         width      = "fit"
@@ -125,6 +158,8 @@ Launcher {
         direction = "column"
         gap       = 2
         rows      = 6
+        icon_size = 24
+        icon_theme = "hicolor"
         color     = theme.text
         font_size = 14
     }

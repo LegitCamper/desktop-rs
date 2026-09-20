@@ -8,7 +8,7 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     reexports::{
         calloop::{
-            EventLoop,
+            EventLoop, LoopHandle,
             channel::{self, Event as ChannelEvent, Sender},
             timer::{TimeoutAction, Timer},
         },
@@ -46,9 +46,14 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1, zwlr_foreign_toplevel_manager_v1,
 };
 
-use crate::platform::linux::audio::AudioClient;
+use crate::platform::linux::audio::{AudioClient, AudioTarget};
+use crate::platform::linux::custom::{CustomClient, CustomCommands, CustomEvent};
 use crate::platform::linux::status_notifier::{TrayClient, TrayItem, TrayMenuItem};
-use crate::platform::linux::taskbar::Taskbar;
+use crate::platform::linux::system::{
+    BacklightSnapshot, BatterySnapshot, BluetoothSnapshot, NetworkSnapshot, PollClient,
+    backlight_snapshot, battery_snapshot, start_bluetooth, start_network, step_backlight,
+};
+use crate::platform::linux::taskbar::{Taskbar, Workspace};
 
 use crate::platform::linux::apps::Apps;
 use crate::platform::linux::window::{Window, buffer_len};
@@ -73,6 +78,8 @@ const SCAN_POLL: Duration = Duration::from_millis(100);
 const BTN_LEFT: u32 = 0x110;
 /// Linux `BTN_RIGHT`; dismisses the launcher.
 const BTN_RIGHT: u32 = 0x111;
+/// Linux `BTN_MIDDLE`; secondary tray activation and custom middle hooks.
+const BTN_MIDDLE: u32 = 0x112;
 /// Text caret drawn after the query.
 const CARET: &str = "\u{258c}";
 /// Marks the active row without relying on colour alone.
@@ -135,6 +142,48 @@ pub fn run(window: Window) -> Result<()> {
     let mut apps: Option<Apps> = None;
     let (backend_sender, backend_channel) = channel::channel();
     let audio = contains_audio(&window.root).then(|| AudioClient::start(backend_sender.clone()));
+    let battery = contains_battery(&window.root).then(|| {
+        PollClient::start(
+            "battery",
+            poll_interval(&window.root, WidgetKind::Battery),
+            battery_snapshot(),
+            backend_sender.clone(),
+            battery_snapshot,
+        )
+    });
+    let backlight = contains_backlight(&window.root).then(|| {
+        PollClient::start(
+            "backlight",
+            poll_interval(&window.root, WidgetKind::Backlight),
+            backlight_snapshot(),
+            backend_sender.clone(),
+            backlight_snapshot,
+        )
+    });
+    let network = contains_network(&window.root).then(|| {
+        start_network(
+            poll_interval(&window.root, WidgetKind::Network),
+            backend_sender.clone(),
+        )
+    });
+    let bluetooth = contains_bluetooth(&window.root).then(|| {
+        start_bluetooth(
+            poll_interval(&window.root, WidgetKind::Bluetooth),
+            backend_sender.clone(),
+        )
+    });
+    let custom = custom_configs(&window.root)
+        .into_iter()
+        .map(|config| {
+            let client = CustomClient::start(
+                config.exec,
+                Duration::from_secs(u64::from(config.interval.max(1))),
+                config.commands,
+                backend_sender.clone(),
+            );
+            (config.id, client)
+        })
+        .collect();
     let tray = contains_tray(&window.root).then(|| TrayClient::start(backend_sender.clone()));
     backend_sender
         .send(BackendEvent::Redraw)
@@ -203,6 +252,7 @@ pub fn run(window: Window) -> Result<()> {
         pool,
         window,
         queue_handle,
+        loop_handle: event_loop.handle(),
         width,
         height,
         drawn: false,
@@ -222,6 +272,11 @@ pub fn run(window: Window) -> Result<()> {
         apps,
         taskbar,
         audio,
+        battery,
+        backlight,
+        network,
+        bluetooth,
+        custom,
         tray,
         menu: None,
         status: None,
@@ -270,12 +325,21 @@ fn find_app_list(element: &Element) -> Option<&Content> {
         .or_else(|| element.children.iter().find_map(find_app_list))
 }
 
-/// Replaces dynamic shell widgets (launcher, title, workspaces) with live state.
+const HIDDEN_ID: &str = "\0desktop-rs-hidden";
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dynamic surface expansion reads each independent backend snapshot"
+)]
 fn expand(
     root: &Element,
     apps: Option<&Apps>,
     taskbar: &Taskbar,
     audio: Option<&AudioClient>,
+    battery: Option<&PollClient<BatterySnapshot>>,
+    backlight: Option<&PollClient<BacklightSnapshot>>,
+    network: Option<&PollClient<NetworkSnapshot>>,
+    bluetooth: Option<&PollClient<BluetoothSnapshot>>,
+    custom: &std::collections::HashMap<String, CustomClient>,
     tray: Option<&TrayClient>,
     status: Option<&str>,
 ) -> Element {
@@ -298,10 +362,20 @@ fn expand(
             text,
             selected,
             select_background,
+            icon_size,
+            icon_theme,
             ..
         } => {
             let children = match apps {
-                Some(apps) => result_rows(apps, status, text, selected, *select_background),
+                Some(apps) => result_rows(
+                    apps,
+                    status,
+                    text,
+                    selected,
+                    *select_background,
+                    *icon_size,
+                    icon_theme.as_deref(),
+                ),
                 None => Vec::new(),
             };
             Element {
@@ -335,12 +409,14 @@ fn expand(
             active_background,
             urgent,
             urgent_background,
+            labels,
             gap,
         } => {
-            let list = taskbar.workspaces.workspaces();
+            let list = visible_workspaces(taskbar.workspaces.workspaces(), labels);
             let children = list
-                .iter()
-                .map(|ws| {
+                .into_iter()
+                .enumerate()
+                .map(|(index, ws)| {
                     let (ws_text, bg) = if ws.active {
                         (active, *active_background)
                     } else if ws.urgent {
@@ -351,20 +427,16 @@ fn expand(
                     Element {
                         id: Some(format!("ws:{}", ws.id)),
                         content: Content::Text(Text {
-                            value: if ws.name.is_empty() {
-                                ws.id.clone()
-                            } else {
-                                ws.name.clone()
-                            },
+                            value: workspace_label(labels, index, ws),
                             ..ws_text.clone()
                         }),
                         style: Style {
-                            corner_radius: 4,
+                            corner_radius: 6,
                             ..Style::panel(bg)
                         },
                         width: Size::Fit,
                         height: Size::Fit,
-                        padding: 3,
+                        padding: 7,
                         align: Align::Center,
                         direction: Direction::Row,
                         ..Element::new(Style::panel(Color::TRANSPARENT))
@@ -380,21 +452,132 @@ fn expand(
                 ..root.clone()
             }
         }
-        Content::Audio { text, .. } => {
-            let mut line = text.clone();
-            line.value = match audio.map(AudioClient::snapshot) {
-                Some(snapshot) if snapshot.available && snapshot.muted => {
-                    format!("MUTED {}%", snapshot.volume)
-                }
-                Some(snapshot) if snapshot.available => format!("VOL {}%", snapshot.volume),
-                _ => "VOL --".to_owned(),
-            };
-            Element {
-                id: Some("audio".to_owned()),
-                content: Content::Text(line),
-                ..root.clone()
-            }
-        }
+        Content::Audio {
+            text,
+            target,
+            format,
+            icon,
+            muted_icon,
+            ..
+        } => audio
+            .map(|audio| audio.snapshot(*target))
+            .filter(|snapshot| snapshot.available)
+            .map_or_else(
+                || hidden(root),
+                |snapshot| {
+                    let icon = if snapshot.muted { muted_icon } else { icon };
+                    dynamic_text(
+                        root,
+                        match target {
+                            AudioTarget::Sink => "audio:sink",
+                            AudioTarget::Source => "audio:source",
+                        },
+                        text,
+                        format
+                            .replace("{icon}", icon)
+                            .replace("{volume}", &snapshot.volume.to_string())
+                            .replace("{muted}", if snapshot.muted { "true" } else { "false" }),
+                    )
+                },
+            ),
+        Content::Battery { text, format, icon } => battery
+            .map(PollClient::snapshot)
+            .filter(|snapshot| snapshot.available)
+            .map_or_else(
+                || hidden(root),
+                |snapshot| {
+                    dynamic_text(
+                        root,
+                        "battery",
+                        text,
+                        format
+                            .replace("{icon}", icon)
+                            .replace("{capacity}", &snapshot.capacity.to_string())
+                            .replace("{status}", &snapshot.status)
+                            .replace("{online}", if snapshot.online { "true" } else { "false" }),
+                    )
+                },
+            ),
+        Content::Backlight {
+            text, format, icon, ..
+        } => backlight
+            .map(PollClient::snapshot)
+            .filter(|snapshot| snapshot.available)
+            .map_or_else(
+                || hidden(root),
+                |snapshot| {
+                    dynamic_text(
+                        root,
+                        "backlight",
+                        text,
+                        format
+                            .replace("{icon}", icon)
+                            .replace("{percent}", &snapshot.percent.to_string()),
+                    )
+                },
+            ),
+        Content::Network {
+            text,
+            format,
+            disconnected_format,
+            ..
+        } => network
+            .map(PollClient::snapshot)
+            .filter(|snapshot| snapshot.available)
+            .map_or_else(
+                || hidden(root),
+                |snapshot| {
+                    let value = if snapshot.linked {
+                        format
+                    } else {
+                        disconnected_format
+                    };
+                    dynamic_text(
+                        root,
+                        "network",
+                        text,
+                        value
+                            .replace("{iface}", &snapshot.interface)
+                            .replace("{ssid}", &snapshot.ssid)
+                            .replace("{signal}", &snapshot.signal.to_string())
+                            .replace("{ipv4}", &snapshot.ipv4)
+                            .replace("{prefix}", &snapshot.prefix.to_string())
+                            .replace("{linked}", if snapshot.linked { "true" } else { "false" }),
+                    )
+                },
+            ),
+        Content::Bluetooth { text, format, .. } => bluetooth
+            .map(PollClient::snapshot)
+            .filter(|snapshot| snapshot.available)
+            .map_or_else(
+                || hidden(root),
+                |snapshot| {
+                    dynamic_text(
+                        root,
+                        "bluetooth",
+                        text,
+                        format
+                            .replace("{powered}", if snapshot.powered { "true" } else { "false" })
+                            .replace("{connected}", &snapshot.connected.to_string()),
+                    )
+                },
+            ),
+        Content::Custom { text, format, .. } => root
+            .id
+            .as_deref()
+            .and_then(|id| custom.get(id).map(|client| (id, client.snapshot())))
+            .filter(|(_, snapshot)| snapshot.available)
+            .map_or_else(
+                || hidden(root),
+                |(id, snapshot)| {
+                    dynamic_text(
+                        root,
+                        &format!("custom:{id}"),
+                        text,
+                        format.replace("{output}", &snapshot.output),
+                    )
+                },
+            ),
         Content::Tray {
             text,
             icon_size,
@@ -417,14 +600,78 @@ fn expand(
                 ..root.clone()
             }
         }
-        _ => Element {
-            children: root
+        _ => {
+            let children = root
                 .children
                 .iter()
-                .map(|child| expand(child, apps, taskbar, audio, tray, status))
-                .collect(),
-            ..root.clone()
-        },
+                .map(|child| {
+                    expand(
+                        child, apps, taskbar, audio, battery, backlight, network, bluetooth,
+                        custom, tray, status,
+                    )
+                })
+                .filter(|child| !is_hidden(child))
+                .collect::<Vec<_>>();
+            if !root.children.is_empty() && children.is_empty() {
+                hidden(root)
+            } else {
+                Element {
+                    children,
+                    ..root.clone()
+                }
+            }
+        }
+    }
+}
+
+fn hidden(root: &Element) -> Element {
+    Element {
+        id: Some(HIDDEN_ID.to_owned()),
+        content: root.content.clone(),
+        width: Size::Fixed(0),
+        height: Size::Fixed(0),
+        children: Vec::new(),
+        ..root.clone()
+    }
+}
+
+fn is_hidden(element: &Element) -> bool {
+    element.id.as_deref() == Some(HIDDEN_ID)
+}
+
+fn dynamic_text(root: &Element, id: &str, text: &Text, value: String) -> Element {
+    Element {
+        id: Some(id.to_owned()),
+        content: Content::Text(Text {
+            value,
+            ..text.clone()
+        }),
+        ..root.clone()
+    }
+}
+
+/// Configured labels win by position. Past the end of a non-empty list the
+/// label set keeps counting rather than leaking compositor workspace names,
+/// so a stray eleventh workspace reads `11`, not `terminal`.
+fn workspace_label(labels: &[String], index: usize, ws: &Workspace) -> String {
+    // ext-workspace coordinates are N-dimensional and 0-based; Niri sends
+    // `[group, index]`, so the position lives in the last axis. (Niri's own IPC
+    // reports the same workspace 1-based, hence `position + 1` when labelling.)
+    let position = ws
+        .coordinates
+        .last()
+        .and_then(|position| usize::try_from(*position).ok())
+        .unwrap_or(index);
+    if let Some(label) = labels.get(position) {
+        return label.clone();
+    }
+    if !labels.is_empty() {
+        return (position + 1).to_string();
+    }
+    if ws.name.is_empty() {
+        ws.id.clone()
+    } else {
+        ws.name.clone()
     }
 }
 
@@ -436,6 +683,7 @@ fn tray_item(item: TrayItem, text: &Text, icon_size: u32) -> Element {
         content: Content::Icon {
             name: item.icon_name,
             theme_path: item.icon_theme_path,
+            icon_theme: None,
             pixmaps: item.icon_pixmaps,
             size: icon_size,
             fallback,
@@ -452,7 +700,8 @@ fn tray_item(item: TrayItem, text: &Text, icon_size: u32) -> Element {
 fn search_line(placeholder: &Text, apps: &Apps) -> Text {
     let mut line = placeholder.clone();
     line.value = if !apps.query().is_empty() {
-        format!("{}{}", apps.query(), CARET)
+        let (before, after) = apps.query_around_caret();
+        format!("{before}{CARET}{after}")
     } else if apps.is_scanning() {
         "indexing applications\u{2026}".to_owned()
     } else if apps.matches().is_empty() {
@@ -470,6 +719,8 @@ fn result_rows(
     text: &Text,
     selected: &Text,
     select_background: Color,
+    icon_size: u32,
+    icon_theme: Option<&str>,
 ) -> Vec<Element> {
     let height = line_height(text.font_size).ceil() as u32 + ROW_PADDING * 2;
     let mut rows = status
@@ -491,12 +742,14 @@ fn result_rows(
         } else {
             format!("{marker}{} \u{2014} {}", app.name, app.comment)
         };
+        let row_text = (if active { selected } else { text }).clone();
+        let fallback = Text {
+            value: app.name.chars().next().unwrap_or('?').to_string(),
+            ..row_text.clone()
+        };
         Element {
             id: Some(format!("{ROW_PREFIX}{}", app.id)),
-            content: Content::Text(Text {
-                value: label,
-                ..(if active { selected } else { text }).clone()
-            }),
+            content: Content::Box,
             style: if active {
                 Style {
                     corner_radius: ROW_RADIUS,
@@ -505,22 +758,97 @@ fn result_rows(
             } else {
                 Style::panel(Color::TRANSPARENT)
             },
-            height: Size::Fixed(height),
+            height: Size::Fixed(height.max(icon_size.saturating_add(ROW_PADDING * 2))),
             padding: ROW_PADDING,
+            gap: ROW_PADDING,
             align: Align::Center,
             direction: Direction::Row,
+            children: vec![
+                Element {
+                    content: Content::Icon {
+                        name: (!app.icon.is_empty()).then(|| app.icon.clone()),
+                        theme_path: None,
+                        icon_theme: icon_theme.map(str::to_owned),
+                        pixmaps: Vec::new(),
+                        size: icon_size,
+                        fallback,
+                    },
+                    width: Size::Fixed(icon_size),
+                    height: Size::Fixed(icon_size),
+                    ..Element::new(Style::panel(Color::TRANSPARENT))
+                },
+                Element {
+                    content: Content::Text(Text {
+                        value: label,
+                        ..row_text
+                    }),
+                    width: Size::Grow,
+                    height: Size::Fit,
+                    ..Element::new(Style::panel(Color::TRANSPARENT))
+                },
+            ],
             ..Element::new(Style::panel(Color::TRANSPARENT))
         }
     }));
     rows
 }
 
-fn find_audio_config(element: &Element) -> Option<(u32, u32)> {
+/// Workspaces the bar actually draws. Configured labels also cap Niri's
+/// trailing spare workspace, and wheel navigation must match what is visible.
+/// Workspaces a configured label list covers. Coordinates are 0-based, so a
+/// ten-label list stops at coordinate 9 — dropping Niri's trailing spare.
+fn visible_workspaces<'a>(list: &'a [Workspace], labels: &[String]) -> Vec<&'a Workspace> {
+    list.iter()
+        .filter(|ws| {
+            labels.is_empty()
+                || ws
+                    .coordinates
+                    .last()
+                    .is_none_or(|position| (*position as usize) < labels.len())
+        })
+        .collect()
+}
+
+/// Id of the workspace `notches` wheel steps away from the active one, wrapping
+/// at both ends. `None` when there is nothing to move between.
+fn workspace_after(list: &[&Workspace], notches: i32) -> Option<String> {
+    if list.len() < 2 || notches == 0 {
+        return None;
+    }
+    let active = list.iter().position(|ws| ws.active)?;
+    let length = list.len() as isize;
+    let index = (active as isize + notches as isize).rem_euclid(length);
+    list.get(index as usize).map(|ws| ws.id.clone())
+}
+
+/// Configured `labels` of the first `Workspaces` widget, for the wheel filter.
+fn find_workspace_labels(element: &Element) -> Option<&[String]> {
+    match &element.content {
+        Content::Workspaces { labels, .. } => Some(labels),
+        _ => element.children.iter().find_map(find_workspace_labels),
+    }
+}
+
+/// Percentage points one `Backlight` wheel notch moves.
+fn find_backlight_step(element: &Element) -> Option<u32> {
+    match &element.content {
+        Content::Backlight { step, .. } => Some(*step),
+        _ => element.children.iter().find_map(find_backlight_step),
+    }
+}
+
+fn find_audio_config(element: &Element, target: AudioTarget) -> Option<(u32, u32)> {
     match &element.content {
         Content::Audio {
-            step, max_volume, ..
-        } => Some((*step, *max_volume)),
-        _ => element.children.iter().find_map(find_audio_config),
+            target: configured,
+            step,
+            max_volume,
+            ..
+        } if *configured == target => Some((*step, *max_volume)),
+        _ => element
+            .children
+            .iter()
+            .find_map(|child| find_audio_config(child, target)),
     }
 }
 
@@ -530,6 +858,89 @@ fn contains_clock(element: &element::Element) -> bool {
 
 fn contains_audio(element: &Element) -> bool {
     matches!(element.content, Content::Audio { .. }) || element.children.iter().any(contains_audio)
+}
+
+fn contains_battery(element: &Element) -> bool {
+    matches!(element.content, Content::Battery { .. })
+        || element.children.iter().any(contains_battery)
+}
+
+fn contains_backlight(element: &Element) -> bool {
+    matches!(element.content, Content::Backlight { .. })
+        || element.children.iter().any(contains_backlight)
+}
+
+fn contains_network(element: &Element) -> bool {
+    matches!(element.content, Content::Network { .. })
+        || element.children.iter().any(contains_network)
+}
+
+fn contains_bluetooth(element: &Element) -> bool {
+    matches!(element.content, Content::Bluetooth { .. })
+        || element.children.iter().any(contains_bluetooth)
+}
+
+#[derive(Clone, Copy)]
+enum WidgetKind {
+    Battery,
+    Backlight,
+    Network,
+    Bluetooth,
+}
+
+fn poll_interval(element: &Element, kind: WidgetKind) -> Duration {
+    fn configured(element: &Element, kind: WidgetKind) -> Option<u32> {
+        match (&element.content, kind) {
+            (Content::Network { interval, .. }, WidgetKind::Network)
+            | (Content::Bluetooth { interval, .. }, WidgetKind::Bluetooth) => Some(*interval),
+            (Content::Battery { .. }, WidgetKind::Battery)
+            | (Content::Backlight { .. }, WidgetKind::Backlight) => Some(5),
+            _ => element
+                .children
+                .iter()
+                .find_map(|child| configured(child, kind)),
+        }
+    }
+    Duration::from_secs(u64::from(configured(element, kind).unwrap_or(5).max(1)))
+}
+
+struct CustomConfig {
+    id: String,
+    exec: String,
+    interval: u32,
+    commands: CustomCommands,
+}
+
+fn custom_configs(element: &Element) -> Vec<CustomConfig> {
+    let mut configs = Vec::new();
+    if let Content::Custom {
+        exec,
+        interval,
+        on_click,
+        on_right_click,
+        on_middle_click,
+        on_scroll_up,
+        on_scroll_down,
+        ..
+    } = &element.content
+    {
+        if let Some(id) = &element.id {
+            configs.push(CustomConfig {
+                id: id.clone(),
+                exec: exec.clone(),
+                interval: *interval,
+                commands: CustomCommands {
+                    on_click: on_click.clone(),
+                    on_right_click: on_right_click.clone(),
+                    on_middle_click: on_middle_click.clone(),
+                    on_scroll_up: on_scroll_up.clone(),
+                    on_scroll_down: on_scroll_down.clone(),
+                },
+            });
+        }
+    }
+    configs.extend(element.children.iter().flat_map(custom_configs));
+    configs
 }
 
 fn contains_tray(element: &Element) -> bool {
@@ -751,6 +1162,8 @@ struct State {
     pool: SlotPool,
     window: Window,
     queue_handle: QueueHandle<Self>,
+    /// Kept so keyboards can be created with SCTK-driven key repeat.
+    loop_handle: LoopHandle<'static, Self>,
     width: u32,
     height: u32,
     drawn: bool,
@@ -770,6 +1183,11 @@ struct State {
     apps: Option<Apps>,
     taskbar: Taskbar,
     audio: Option<AudioClient>,
+    battery: Option<PollClient<BatterySnapshot>>,
+    backlight: Option<PollClient<BacklightSnapshot>>,
+    network: Option<PollClient<NetworkSnapshot>>,
+    bluetooth: Option<PollClient<BluetoothSnapshot>>,
+    custom: std::collections::HashMap<String, CustomClient>,
     tray: Option<TrayClient>,
     menu: Option<MenuPopup>,
     /// Last launcher error to show until the next key or click.
@@ -839,6 +1257,11 @@ impl State {
             self.apps.as_ref(),
             &self.taskbar,
             self.audio.as_ref(),
+            self.battery.as_ref(),
+            self.backlight.as_ref(),
+            self.network.as_ref(),
+            self.bluetooth.as_ref(),
+            &self.custom,
             self.tray.as_ref(),
             self.status.as_deref(),
         );
@@ -901,7 +1324,7 @@ impl State {
                 self.redraw();
             }
             Some(Err(error)) => {
-                self.status = Some(error.to_string());
+                self.status = Some(format!("{error:#}"));
                 self.redraw();
             }
             None => {}
@@ -934,6 +1357,12 @@ impl State {
             xkeysym::key::BackSpace => apps.backspace(ctrl),
             xkeysym::key::Delete => apps.clear_query(),
             xkeysym::key::u if ctrl => apps.clear_query(),
+            xkeysym::key::Left => apps.move_caret(-1),
+            xkeysym::key::Right => apps.move_caret(1),
+            xkeysym::key::a if ctrl => apps.caret_to_start(),
+            xkeysym::key::e if ctrl => apps.caret_to_end(),
+            xkeysym::key::w if ctrl => apps.backspace(true),
+            xkeysym::key::k if ctrl => apps.delete_to_end(),
             xkeysym::key::Up => apps.select(-1),
             xkeysym::key::Down => apps.select(1),
             xkeysym::key::Page_Up => apps.page_by(-1),
@@ -971,9 +1400,26 @@ impl State {
                 }
                 return;
             }
+            if self.custom_event(hit.as_deref(), CustomEvent::RightClick) {
+                return;
+            }
             if self.apps.is_some() {
                 self.exit = true;
             }
+            return;
+        }
+        if button == BTN_MIDDLE {
+            if let Some(address) = hit.as_deref().and_then(|id| id.strip_prefix("tray:")) {
+                if let Some(tray) = &self.tray {
+                    tray.secondary_activate(
+                        address.to_owned(),
+                        position.0 as i32,
+                        position.1 as i32,
+                    );
+                }
+                return;
+            }
+            self.custom_event(hit.as_deref(), CustomEvent::MiddleClick);
             return;
         }
         if button != BTN_LEFT {
@@ -989,9 +1435,20 @@ impl State {
             }
             return;
         }
-        if hit.as_deref() == Some("audio") {
+        if let Some(target) = hit.as_deref().and_then(|id| id.strip_prefix("audio:")) {
             if let Some(audio) = &self.audio {
-                audio.toggle_mute();
+                let target = if target == "source" {
+                    AudioTarget::Source
+                } else {
+                    AudioTarget::Sink
+                };
+                audio.toggle_mute(target);
+            }
+            return;
+        }
+        if let Some(id) = hit.as_deref().and_then(|id| id.strip_prefix("custom:")) {
+            if let Some(custom) = self.custom.get(id) {
+                custom.dispatch(CustomEvent::Click);
             }
             return;
         }
@@ -1008,6 +1465,18 @@ impl State {
         }
     }
 
+    /// Sends `event` to the `Custom` widget under `hit`; true when one matched.
+    fn custom_event(&self, hit: Option<&str>, event: CustomEvent) -> bool {
+        let Some(custom) = hit
+            .and_then(|id| id.strip_prefix("custom:"))
+            .and_then(|id| self.custom.get(id))
+        else {
+            return false;
+        };
+        custom.dispatch(event);
+        true
+    }
+
     fn handle_scroll(&mut self, vertical: &AxisScroll) {
         let steps = vertical
             .value120
@@ -1021,24 +1490,77 @@ impl State {
         } else {
             steps.signum()
         };
-        if self.hovered.as_deref() == Some("audio") {
+        if let Some(target) = self
+            .hovered
+            .as_deref()
+            .and_then(|id| id.strip_prefix("audio:"))
+        {
+            let target = if target == "source" {
+                AudioTarget::Source
+            } else {
+                AudioTarget::Sink
+            };
             if let (Some(audio), Some((step, max_volume))) =
-                (&self.audio, find_audio_config(&self.window.root))
+                (&self.audio, find_audio_config(&self.window.root, target))
             {
                 // Positive Wayland axis values scroll down, which lowers volume.
-                audio.step_volume(-notches * step as i32, max_volume);
+                audio.step_volume(target, -notches * step as i32, max_volume);
             }
             return;
         }
-        if let Some(address) = self
+        if let Some(tray) = self
             .hovered
             .as_deref()
             .and_then(|id| id.strip_prefix("tray:"))
+            .zip(self.tray.as_ref())
         {
-            if let Some(tray) = &self.tray {
-                tray.scroll(address.to_owned(), -notches);
+            let (address, tray) = (tray.0.to_owned(), tray.1);
+            tray.scroll(address, -notches);
+            return;
+        }
+        if self
+            .hovered
+            .as_deref()
+            .is_some_and(|id| id.starts_with("ws:"))
+        {
+            let labels = find_workspace_labels(&self.window.root)
+                .map(<[String]>::to_vec)
+                .unwrap_or_default();
+            // Positive Wayland axis values scroll down, which moves forward.
+            let next = workspace_after(
+                &visible_workspaces(self.taskbar.workspaces.workspaces(), &labels),
+                notches,
+            );
+            if let Some(id) = next {
+                self.taskbar.activate_workspace(&id);
             }
             return;
+        }
+        if self.hovered.as_deref() == Some("backlight") {
+            let step = find_backlight_step(&self.window.root).unwrap_or(5) as i32;
+            // Positive Wayland axis values scroll down, which dims.
+            match step_backlight(-notches * step) {
+                Ok(snapshot) => {
+                    if let Some(backlight) = &self.backlight {
+                        backlight.publish(snapshot);
+                    }
+                    self.redraw();
+                }
+                Err(error) => eprintln!("step backlight: {error:#}"),
+            }
+            return;
+        }
+        let hovered = self.hovered.clone();
+        let wheel = match notches.signum() {
+            -1 => Some(CustomEvent::ScrollUp),
+            1 => Some(CustomEvent::ScrollDown),
+            _ => None,
+        };
+        if let Some(event) = wheel {
+            // One command per wheel event, not one per notch.
+            if self.custom_event(hovered.as_deref(), event) {
+                return;
+            }
         }
         let delta = notches as isize;
         let scrolled = self.apps.as_mut().is_some_and(|apps| {
@@ -1544,7 +2066,16 @@ impl SeatHandler for State {
         capability: Capability,
     ) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
-            match self.seat_state.get_keyboard(queue_handle, &seat, None) {
+            // Repeat through calloop so held keys work on compositors that only
+            // send one press event and leave repeat timing to the client.
+            let keyboard = self.seat_state.get_keyboard_with_repeat(
+                queue_handle,
+                &seat,
+                None,
+                self.loop_handle.clone(),
+                Box::new(|state, _, event| state.handle_key(&event)),
+            );
+            match keyboard {
                 Ok(keyboard) => self.keyboard = Some(keyboard),
                 Err(error) => self.error = Some(error.into()),
             }
@@ -1779,6 +2310,98 @@ mod tests {
         assert!(delay <= Duration::from_secs(1));
     }
 
+    fn workspace(id: &str, position: u32, active: bool) -> Workspace {
+        Workspace {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            coordinates: vec![position],
+            active,
+            urgent: false,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn workspace_after_should_step_forward_and_back() {
+        let list = [
+            workspace("a", 1, false),
+            workspace("b", 2, true),
+            workspace("c", 3, false),
+        ];
+        let visible = visible_workspaces(&list, &[]);
+
+        assert_eq!(workspace_after(&visible, 1).as_deref(), Some("c"));
+        assert_eq!(workspace_after(&visible, -1).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn workspace_after_should_wrap_at_both_ends() {
+        let last_active = [
+            workspace("a", 1, false),
+            workspace("b", 2, false),
+            workspace("c", 3, true),
+        ];
+        let first_active = [
+            workspace("a", 1, true),
+            workspace("b", 2, false),
+            workspace("c", 3, false),
+        ];
+
+        assert_eq!(
+            workspace_after(&visible_workspaces(&last_active, &[]), 1).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            workspace_after(&visible_workspaces(&first_active, &[]), -1).as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn workspace_after_should_honour_multi_notch_wheel_events() {
+        let list = [
+            workspace("a", 1, true),
+            workspace("b", 2, false),
+            workspace("c", 3, false),
+            workspace("d", 4, false),
+        ];
+
+        assert_eq!(
+            workspace_after(&visible_workspaces(&list, &[]), 2).as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn workspace_after_should_skip_workspaces_the_labels_hide() {
+        // Coordinates are 0-based, so two labels cover positions 0 and 1 only.
+        let list = [
+            workspace("a", 0, false),
+            workspace("b", 1, true),
+            workspace("spare", 2, false),
+        ];
+        let labels = ["one".to_owned(), "two".to_owned()];
+
+        assert_eq!(
+            workspace_after(&visible_workspaces(&list, &labels), 1).as_deref(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn workspace_after_should_report_nothing_without_an_active_workspace() {
+        let list = [workspace("a", 1, false), workspace("b", 2, false)];
+
+        assert_eq!(workspace_after(&visible_workspaces(&list, &[]), 1), None);
+    }
+
+    #[test]
+    fn workspace_after_should_report_nothing_for_a_single_workspace() {
+        let list = [workspace("a", 1, true)];
+
+        assert_eq!(workspace_after(&visible_workspaces(&list, &[]), 1), None);
+    }
+
     #[test]
     fn contains_clock_should_search_descendants() {
         let mut root = Element::new(Style::panel(Color::TRANSPARENT));
@@ -1825,6 +2448,8 @@ mod tests {
                         selected: styled("active"),
                         select_background: Color::rgba(0x11, 0x22, 0x33, 0x44),
                         rows,
+                        icon_size: 24,
+                        icon_theme: None,
                         terminal,
                     },
                     ..Element::new(Style::panel(Color::TRANSPARENT))
@@ -1881,38 +2506,204 @@ mod tests {
     }
 
     #[test]
+    fn workspace_label_should_follow_the_trailing_coordinate_axis() {
+        // Niri names workspaces freely and reports `[group, 0-based index]`.
+        let ws = Workspace {
+            id: "ws_17".to_owned(),
+            name: "browser".to_owned(),
+            coordinates: vec![0, 0],
+            active: true,
+            urgent: false,
+            hidden: false,
+        };
+        let labels = (1..=10).map(|n| n.to_string()).collect::<Vec<_>>();
+
+        // The first workspace sits at coordinate 0 and must read "1", not "2".
+        assert_eq!(workspace_label(&labels, 4, &ws), "1");
+
+        let second = Workspace {
+            coordinates: vec![0, 1],
+            name: "terminal".to_owned(),
+            ..ws.clone()
+        };
+        // Third in the protocol list, but coordinate 1, so it reads "2".
+        assert_eq!(workspace_label(&labels, 2, &second), "2");
+
+        let spare = Workspace {
+            coordinates: vec![0, 10],
+            ..ws.clone()
+        };
+        assert_eq!(workspace_label(&labels, 0, &spare), "11");
+
+        let unpositioned = Workspace {
+            coordinates: Vec::new(),
+            ..ws.clone()
+        };
+        assert_eq!(workspace_label(&labels, 4, &unpositioned), "5");
+        assert_eq!(workspace_label(&[], 4, &unpositioned), "browser");
+    }
+
+    #[test]
+    fn workspaces_should_stop_at_the_configured_label_count() {
+        let mut taskbar = Taskbar::default();
+        for index in 0..3 {
+            let id = format!("ws_{index}");
+            taskbar.workspaces.workspace_created(id.clone());
+            taskbar.workspaces.set_name(&id, format!("name_{index}"));
+            taskbar.workspaces.set_coordinates(&id, vec![0, index]);
+        }
+        taskbar.workspaces.commit_done();
+
+        let element = Element {
+            content: Content::Workspaces {
+                text: styled("ws"),
+                active: styled("ws_act"),
+                active_background: Color::rgba(0xff, 0xff, 0xff, 0x44),
+                urgent: styled("ws_urg"),
+                urgent_background: Color::rgba(0xff, 0x00, 0x00, 0x44),
+                labels: vec!["1".to_owned(), "2".to_owned()],
+                gap: 4,
+            },
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        };
+
+        let expanded = expand(
+            &element,
+            None,
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+
+        let rendered = expanded
+            .children
+            .iter()
+            .map(|child| match &child.content {
+                Content::Text(text) => text.value.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, ["1", "2"]);
+    }
+
+    #[test]
+    fn expand_should_hide_wrappers_emptied_by_dynamic_children() {
+        let child = Element {
+            content: Content::Battery {
+                text: styled("battery"),
+                format: "{capacity}%".to_owned(),
+                icon: String::new(),
+            },
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        };
+        let wrapper = Element {
+            children: vec![child],
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        };
+        let taskbar = Taskbar::default();
+        let expanded = expand(
+            &wrapper,
+            None,
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+
+        assert!(is_hidden(&expanded));
+        assert!(
+            !is_hidden(&Element::new(Style::panel(Color::TRANSPARENT))),
+            "explicit empty boxes remain visible spacers"
+        );
+    }
+
+    #[test]
     fn expand_should_draw_visible_rows_and_mark_selection() {
         // Empty-query order is alphabetical, so rows 0 and 1 hold alpha and beta.
         let apps = indexed(&["alpha", "beta", "gamma"]);
         let tree = launcher_tree(2, Vec::new());
         let taskbar = Taskbar::default();
 
-        let list = &expand(&tree, Some(&apps), &taskbar, None, None, None).children[1];
+        let list = &expand(
+            &tree,
+            Some(&apps),
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        )
+        .children[1];
         assert_eq!(list.children.len(), 2);
         assert_eq!(list.children[0].id.as_deref(), Some("app:alpha"));
         assert_eq!(list.children[1].id.as_deref(), Some("app:beta"));
 
-        let Content::Text(active) = &list.children[0].content else {
-            panic!("rows should carry text");
+        let Content::Box = &list.children[0].content else {
+            panic!("rows should be boxes");
         };
-        assert!(
-            active.value.starts_with('▸'),
-            "the selected row needs a non-colour marker, found `{}`",
-            active.value
-        );
+        let Content::Text(active) = &list.children[0].children[1].content else {
+            panic!("rows should carry text children");
+        };
+        assert_eq!(active.value, "▸ alpha");
         assert_eq!(
             list.children[0].style.background,
             Color::rgba(0x11, 0x22, 0x33, 0x44)
         );
 
-        let Content::Text(plain) = &list.children[1].content else {
-            panic!("rows should carry text");
+        let Content::Text(plain) = &list.children[1].children[1].content else {
+            panic!("rows should carry text children");
         };
-        assert!(
-            plain.value.starts_with("  "),
-            "unselected rows must not carry the marker"
-        );
+        assert_eq!(plain.value, "  beta");
         assert_eq!(list.children[1].style.background, Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn result_rows_should_wrap_icon_and_grow_text_in_clickable_box() {
+        let mut app = entry("terminal");
+        app.icon = "utilities-terminal".to_owned();
+        let apps = Apps::from_index(vec![app]);
+
+        let rows = result_rows(
+            &apps,
+            None,
+            &styled("row"),
+            &styled("active"),
+            Color::TRANSPARENT,
+            32,
+            Some("Papirus"),
+        );
+        let row = &rows[0];
+        assert_eq!(row.id.as_deref(), Some("app:terminal"));
+        assert!(matches!(row.content, Content::Box));
+        let Content::Icon {
+            name,
+            icon_theme,
+            size,
+            ..
+        } = &row.children[0].content
+        else {
+            panic!("first row child should be icon");
+        };
+        assert_eq!(
+            (name.as_deref(), icon_theme.as_deref(), *size),
+            (Some("utilities-terminal"), Some("Papirus"), 32)
+        );
+        assert_eq!(row.children[1].width, Size::Grow);
     }
 
     #[test]
@@ -1921,16 +2712,44 @@ mod tests {
         let tree = launcher_tree(2, Vec::new());
         let taskbar = Taskbar::default();
 
-        let Content::Text(placeholder) =
-            &expand(&tree, Some(&apps), &taskbar, None, None, None).children[0].children[0].content
+        let Content::Text(placeholder) = &expand(
+            &tree,
+            Some(&apps),
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        )
+        .children[0]
+            .children[0]
+            .content
         else {
             panic!("the search box should hold one text child");
         };
         assert_eq!(placeholder.value, "Search applications\u{2026}");
 
         apps.type_text("on");
-        let Content::Text(query) =
-            &expand(&tree, Some(&apps), &taskbar, None, None, None).children[0].children[0].content
+        let Content::Text(query) = &expand(
+            &tree,
+            Some(&apps),
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        )
+        .children[0]
+            .children[0]
+            .content
         else {
             panic!("the search box should hold one text child");
         };
@@ -1941,6 +2760,11 @@ mod tests {
             Some(&apps),
             &taskbar,
             None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
             None,
             Some("launch failed"),
         )
@@ -1985,18 +2809,43 @@ mod tests {
                 active_background: Color::rgba(0xff, 0xff, 0xff, 0x44),
                 urgent: styled("ws_urg"),
                 urgent_background: Color::rgba(0xff, 0x00, 0x00, 0x44),
+                labels: vec!["1".to_owned()],
                 gap: 6,
             },
             ..Element::new(Style::panel(Color::TRANSPARENT))
         };
 
-        let expanded_title = expand(&title_elem, None, &taskbar, None, None, None);
+        let expanded_title = expand(
+            &title_elem,
+            None,
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
         let Content::Text(text) = &expanded_title.content else {
             panic!("expanded ActiveWindow should have Text content");
         };
         assert_eq!(text.value, "Firefox Ni…");
 
-        let expanded_ws = expand(&ws_elem, None, &taskbar, None, None, None);
+        let expanded_ws = expand(
+            &ws_elem,
+            None,
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
         assert_eq!(expanded_ws.children.len(), 1);
         assert_eq!(expanded_ws.children[0].id.as_deref(), Some("ws:ws_1"));
         assert_eq!(

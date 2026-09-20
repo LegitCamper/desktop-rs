@@ -20,6 +20,6 @@ Launcher {
         value = "Type to search applications…" color = theme.text font_size = 17
     }
     AppList {
-        height = "grow" rows = 8 color = theme.text font_size = 14
+        height = "grow" rows = 8 icon_size = 28 icon_theme = "hicolor" color = theme.text font_size = 14
     }
 }

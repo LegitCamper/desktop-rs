@@ -22,6 +22,7 @@ pub fn render(
         if let crate::ui::element::Content::Icon {
             name,
             theme_path,
+            icon_theme,
             pixmaps,
             size,
             ..
@@ -29,7 +30,11 @@ pub fn render(
         {
             let image = name
                 .as_deref()
-                .and_then(|name| images.named(name, theme_path.as_deref(), *size, 1).cloned())
+                .and_then(|name| {
+                    images
+                        .named(name, theme_path.as_deref(), icon_theme.as_deref(), *size, 1)
+                        .cloned()
+                })
                 .or_else(|| images.pixmap(pixmaps, *size, 1).cloned());
             if let Some(image) = image {
                 draw_image(canvas, width, height, item.rect, &image);
@@ -42,16 +47,21 @@ pub fn render(
 }
 
 fn draw_image(canvas: &mut [u8], canvas_width: u32, canvas_height: u32, rect: Rect, image: &Image) {
-    let x0 = (rect.x + (rect.width - image.width as f32) / 2.0)
-        .round()
-        .max(0.0) as u32;
-    let y0 = (rect.y + (rect.height - image.height as f32) / 2.0)
-        .round()
-        .max(0.0) as u32;
-    for y in 0..image.height.min(canvas_height.saturating_sub(y0)) {
-        for x in 0..image.width.min(canvas_width.saturating_sub(x0)) {
+    let x0 = (rect.x + (rect.width - image.width as f32) / 2.0).round();
+    let y0 = (rect.y + (rect.height - image.height as f32) / 2.0).round();
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let (Ok(target_x), Ok(target_y)) = (
+                u32::try_from(x0 as i64 + i64::from(x)),
+                u32::try_from(y0 as i64 + i64::from(y)),
+            ) else {
+                continue;
+            };
+            if target_x >= canvas_width || target_y >= canvas_height {
+                continue;
+            }
             let source = ((y * image.width + x) * 4) as usize;
-            let destination = (((y0 + y) * canvas_width + x0 + x) * 4) as usize;
+            let destination = ((target_y * canvas_width + target_x) * 4) as usize;
             let (Some(source), Some(destination)) = (
                 image.pixels.get(source..source + 4),
                 canvas.get_mut(destination..destination + 4),
