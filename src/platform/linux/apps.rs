@@ -69,7 +69,7 @@ fn parse(path: &Path, id: &str, locale: &str) -> Option<App> {
     {
         return None;
     }
-    let executable = entry.parse_exec().ok()?;
+    let executable = parse_exec(&entry)?;
     if !executable.first().is_some_and(|program| available(program)) {
         return None;
     }
@@ -97,6 +97,14 @@ fn parse(path: &Path, id: &str, locale: &str) -> Option<App> {
         icon: entry.icon().unwrap_or("").to_owned(),
         path: path.to_owned(),
     })
+}
+
+fn parse_exec(entry: &DesktopEntry) -> Option<Vec<String>> {
+    let mut executable = entry.parse_exec().ok()?;
+    // Flatpak uses these sentinels around file-forwarding field codes. They are
+    // launcher metadata, not argv; the dependency intentionally preserves them.
+    executable.retain(|argument| !matches!(argument.as_str(), "@@" | "@@u"));
+    (!executable.is_empty()).then_some(executable)
 }
 
 fn shown_in(only: Option<Vec<&str>>) -> bool {
@@ -145,10 +153,30 @@ fn in_path(candidate: &str) -> bool {
 }
 
 fn executable(path: &Path) -> bool {
+    executable_file(path) || host_path(path).is_some_and(|path| executable_file(&path))
+}
+
+fn executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Host equivalent of an absolute path inside a sandboxed desktop session.
+fn host_path(path: &Path) -> Option<PathBuf> {
+    path.is_absolute()
+        .then(|| path.strip_prefix("/").ok())
+        .flatten()
+        .map(|path| Path::new("/run/host").join(path))
+}
+
+fn program_path(program: &str) -> PathBuf {
+    let path = PathBuf::from(program);
+    if executable_file(&path) {
+        return path;
+    }
+    host_path(&path).unwrap_or(path)
 }
 
 /// Compact subsequence score. Higher is better; `None` means no match.
@@ -249,7 +277,7 @@ pub fn launch(app: &App, terminal: &[String]) -> Result<()> {
             command
         }
         (false, _) => {
-            let mut command = Command::new(&app.executable[0]);
+            let mut command = Command::new(program_path(&app.executable[0]));
             command.args(&app.executable[1..]);
             command
         }
@@ -679,6 +707,24 @@ mod tests {
         )?;
         let app = parse(&path, "editor", "en_US").context("parse editor entry")?;
         assert_eq!(app.executable, ["/bin/sh".to_owned()]);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exec_parsing_should_remove_flatpak_file_forwarding_markers() -> Result<()> {
+        let root = temp_dir("flatpak-exec");
+        let path = write(
+            &root,
+            "flatpak.desktop",
+            "[Desktop Entry]\nType=Application\nName=Flatpak App\nExec=/bin/sh run --file-forwarding org.example.App @@u %U @@\n",
+        )?;
+        let app = parse(&path, "flatpak", "en_US").context("parse Flatpak entry")?;
+
+        assert_eq!(
+            app.executable,
+            ["/bin/sh", "run", "--file-forwarding", "org.example.App"]
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
