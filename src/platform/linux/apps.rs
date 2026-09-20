@@ -171,13 +171,25 @@ fn host_path(path: &Path) -> Option<PathBuf> {
         .map(|path| Path::new("/run/host").join(path))
 }
 
-fn program_path(program: &str) -> PathBuf {
-    let path = PathBuf::from(program);
-    if executable_file(&path) {
-        return path;
+/// Builds the process for `argv`. A program that only exists under `/run/host`
+/// cannot be exec'd directly — it links against host libraries this sandbox does
+/// not have — so it runs on the host through the Flatpak portal instead.
+fn command_for(argv: &[String]) -> Command {
+    let program = &argv[0];
+    if !executable_file(Path::new(program))
+        && host_path(Path::new(program)).is_some_and(|path| executable_file(&path))
+        && available(HOST_SPAWN)
+    {
+        let mut command = Command::new(HOST_SPAWN);
+        command.arg("--host").args(argv);
+        return command;
     }
-    host_path(&path).unwrap_or(path)
+    let mut command = Command::new(program);
+    command.args(&argv[1..]);
+    command
 }
+
+const HOST_SPAWN: &str = "flatpak-spawn";
 
 /// Compact subsequence score. Higher is better; `None` means no match.
 pub fn score(needle: &str, haystack: &str) -> Option<u32> {
@@ -276,11 +288,7 @@ pub fn launch(app: &App, terminal: &[String]) -> Result<()> {
             command.args(prefix).args(&app.executable);
             command
         }
-        (false, _) => {
-            let mut command = Command::new(program_path(&app.executable[0]));
-            command.args(&app.executable[1..]);
-            command
-        }
+        (false, _) => command_for(&app.executable),
     };
     let child = command
         .stdin(Stdio::null())
@@ -750,6 +758,29 @@ mod tests {
             bail!("marker script did not run");
         }
         Ok(())
+    }
+
+    /// A program that only exists under `/run/host` must not be exec'd by that
+    /// path: it links against host libraries absent from the sandbox and dies
+    /// with 127 after a successful `spawn`, which looks like nothing happening.
+    #[test]
+    fn command_for_should_route_host_only_programs_through_the_portal() {
+        let argv = vec!["/definitely/not/here/flatpak".to_owned(), "run".to_owned()];
+        let command = command_for(&argv);
+
+        assert_eq!(command.get_program(), "/definitely/not/here/flatpak");
+
+        let host_only = ["/usr/bin/flatpak".to_owned(), "run".to_owned()];
+        if executable_file(Path::new(&host_only[0])) || !available(HOST_SPAWN) {
+            return; // Not a sandboxed session; nothing to assert.
+        }
+        if !host_path(Path::new(&host_only[0])).is_some_and(|path| executable_file(&path)) {
+            return; // No host flatpak either.
+        }
+        let command = command_for(&host_only);
+        assert_eq!(command.get_program(), HOST_SPAWN);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["--host", "/usr/bin/flatpak", "run"]);
     }
 
     #[test]
