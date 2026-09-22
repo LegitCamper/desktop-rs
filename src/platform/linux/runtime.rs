@@ -437,7 +437,9 @@ fn expand(
                         (text, Color::TRANSPARENT)
                     };
                     // Text draws from its own rect's origin, so the label lives in a
-                    // child and the padded parent centres it on both axes.
+                    // child that fills the button. Padding is uniform, so vertical
+                    // padding would squeeze the inner rect below one line height and
+                    // strand the glyphs; a fixed button width widens the target.
                     Element {
                         id: Some(format!("ws:{}", ws.id)),
                         content: Content::Box,
@@ -445,19 +447,20 @@ fn expand(
                             corner_radius: 6,
                             ..Style::panel(bg)
                         },
-                        width: Size::Fit,
+                        width: Size::Fixed(workspace_button_width(ws_text.font_size)),
                         height: Size::Grow,
-                        padding: 12,
+                        padding: 0,
                         align: Align::Center,
                         justify: Align::Center,
                         direction: Direction::Row,
                         children: vec![Element {
                             content: Content::Text(Text {
                                 value: workspace_label(labels, index, ws),
+                                align: Align::Center,
                                 ..ws_text.clone()
                             }),
-                            width: Size::Fit,
-                            height: Size::Fit,
+                            width: Size::Grow,
+                            height: Size::Grow,
                             ..Element::new(Style::panel(Color::TRANSPARENT))
                         }],
                         ..Element::new(Style::panel(Color::TRANSPARENT))
@@ -699,6 +702,12 @@ fn dynamic_text(root: &Element, id: &str, text: &Text, value: String) -> Element
     }
 }
 
+/// Click-target width for one workspace button, scaled off the font so the
+/// widest label ("10") still has room either side.
+fn workspace_button_width(font_size: u32) -> u32 {
+    font_size.saturating_mul(2).max(28)
+}
+
 /// Configured labels win by position. Past the end of a non-empty list the
 /// label set keeps counting rather than leaking compositor workspace names,
 /// so a stray eleventh workspace reads `11`, not `terminal`.
@@ -737,10 +746,10 @@ fn tray_item(item: TrayItem, text: &Text, icon_size: u32) -> Element {
             size: icon_size,
             fallback,
         },
-        // Icons paint centred, so the box is padded out purely to widen the hit target.
+        // Icons and fallback glyphs both paint centred in the rect, so a fixed
+        // width wider than the icon is what widens the hit target.
         width: Size::Fixed(icon_size.saturating_add(12)),
         height: Size::Grow,
-        padding: 3,
         align: Align::Center,
         direction: Direction::Row,
         ..Element::new(Style::panel(Color::TRANSPARENT))
@@ -2470,6 +2479,67 @@ mod tests {
 
     use super::*;
     use crate::ui::element::Element;
+
+    #[test]
+    fn workspace_button_should_leave_equal_room_above_and_below_the_label() {
+        // Uniform padding on a bar-height button squeezed the label's rect below one
+        // line height, so the centred glyphs sat near the bottom edge. The label rect
+        // must span the whole button for the renderer's vertical centring to bite.
+        const BAR_HEIGHT: u32 = 28;
+        let mut taskbar = Taskbar::default();
+        taskbar.workspaces.workspace_created("ws_0".to_owned());
+        taskbar.workspaces.set_coordinates("ws_0", vec![0, 0]);
+        taskbar.workspaces.commit_done();
+
+        let element = Element {
+            content: Content::Workspaces {
+                text: styled("1"),
+                active: styled("1"),
+                active_background: Color::TRANSPARENT,
+                urgent: styled("1"),
+                urgent_background: Color::TRANSPARENT,
+                labels: vec!["1".to_owned()],
+                gap: 4,
+            },
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        };
+
+        let expanded = expand(
+            &element,
+            None,
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+        let items = element::layout(&expanded, 200, BAR_HEIGHT, &mut |_| (10, 20));
+
+        let Some(button) = items
+            .iter()
+            .find(|item| item.id.as_deref() == Some("ws:ws_0"))
+        else {
+            panic!("expanded workspaces should emit a button");
+        };
+        let Some(label) = items
+            .iter()
+            .find(|item| matches!(item.content, Content::Text(_)))
+        else {
+            panic!("workspace button should own a text label");
+        };
+
+        assert_eq!(button.rect.height, BAR_HEIGHT as f32);
+        assert_eq!(label.rect.y, button.rect.y);
+        assert_eq!(label.rect.height, BAR_HEIGHT as f32);
+        assert!(
+            label.rect.width > 10.0,
+            "button must be wider than its glyph for an easy click target"
+        );
+    }
 
     #[test]
     fn next_second_should_be_positive_and_at_most_one_second() {
