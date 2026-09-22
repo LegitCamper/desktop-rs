@@ -36,6 +36,9 @@ pub struct Text {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Content {
     Box,
+    /// Container drawn only while the surface's panel is open; otherwise the
+    /// runtime collapses it to zero size before any backend expansion runs.
+    Reveal,
     Text(Text),
     Clock {
         text: Text,
@@ -234,11 +237,15 @@ fn place(
         return;
     };
     let pad = element.padding as f32;
+    // Padding is clamped per axis so an over-padded box collapses to a
+    // centred zero-size inner rect instead of drifting towards its far edge.
+    let pad_x = pad.min(rect.width / 2.0).max(0.0);
+    let pad_y = pad.min(rect.height / 2.0).max(0.0);
     let inner = Rect {
-        x: rect.x + pad,
-        y: rect.y + pad,
-        width: (rect.width - pad * 2.0).max(0.0),
-        height: (rect.height - pad * 2.0).max(0.0),
+        x: rect.x + pad_x,
+        y: rect.y + pad_y,
+        width: (rect.width - pad_x * 2.0).max(0.0),
+        height: (rect.height - pad_y * 2.0).max(0.0),
     };
     let row = element.direction == Direction::Row;
     let (main, cross) = if row {
@@ -338,8 +345,10 @@ fn place(
 
 fn natural_size(element: &Element, measure: &mut impl FnMut(&Content) -> (u32, u32)) -> (u32, u32) {
     let own = measure(&element.content);
+    let padding = element.padding.saturating_mul(2);
     if element.children.is_empty() {
-        return own;
+        // A leaf still reserves its padding, so padded text keeps a roomy hit target.
+        return (own.0.saturating_add(padding), own.1.saturating_add(padding));
     }
 
     let children = element
@@ -350,7 +359,6 @@ fn natural_size(element: &Element, measure: &mut impl FnMut(&Content) -> (u32, u
     let gaps = element
         .gap
         .saturating_mul(u32::try_from(children.len().saturating_sub(1)).unwrap_or(u32::MAX));
-    let padding = element.padding.saturating_mul(2);
     let (content_width, content_height) = match element.direction {
         Direction::Row => (
             children
@@ -446,6 +454,23 @@ mod tests {
     }
 
     #[test]
+    fn layout_should_pad_a_fit_leaf_for_a_bigger_hit_target() {
+        let tree = row(
+            vec![Element {
+                width: Size::Fit,
+                padding: 9,
+                ..Element::new(Style::panel(BG))
+            }],
+            0,
+            0,
+        );
+
+        let items = layout(&tree, 100, 30, &mut |_| (20, 12));
+
+        assert_eq!(items[1].rect.width, 38.0);
+    }
+
+    #[test]
     fn layout_should_measure_fit_containers_from_descendants() {
         let tree = row(
             vec![Element {
@@ -524,6 +549,22 @@ mod tests {
         let items = layout(&tree, 100, 30, &mut zero);
 
         assert_eq!(items[1].rect.y, 10.0);
+    }
+
+    #[test]
+    fn layout_should_center_an_over_padded_inner_rect() {
+        // Padding wider than the box used to shove the inner rect past the far
+        // edge; it collapses onto the centre line instead.
+        let tree = Element {
+            padding: 40,
+            children: vec![leaf(Size::Grow)],
+            ..Element::new(Style::panel(BG))
+        };
+
+        let items = layout(&tree, 100, 20, &mut zero);
+
+        assert_eq!(items[1].rect.y, 10.0);
+        assert_eq!(items[1].rect.height, 0.0);
     }
 
     #[test]

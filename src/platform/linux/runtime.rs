@@ -74,6 +74,9 @@ const ROW_RADIUS: u32 = 6;
 const DEFAULT_ROWS: usize = 8;
 /// How often the startup desktop-entry scan is polled before it publishes.
 const SCAN_POLL: Duration = Duration::from_millis(100);
+
+/// Grace period between the pointer leaving and the panel collapsing.
+const PANEL_DWELL: Duration = Duration::from_millis(250);
 /// Linux `BTN_LEFT`; Wayland forwards raw kernel button codes.
 const BTN_LEFT: u32 = 0x110;
 /// Linux `BTN_RIGHT`; dismisses the launcher.
@@ -94,11 +97,15 @@ const MENU_BORDER: Color = Color::rgba(0x5c, 0x6a, 0x82, 0xc0);
 const MENU_TEXT: Color = Color::rgba(0xc0, 0xca, 0xf5, 0xff);
 const MENU_DISABLED: Color = Color::rgba(0x56, 0x5f, 0x89, 0xff);
 const MENU_SELECTED: Color = Color::rgba(0x41, 0x48, 0x68, 0xff);
+/// Tint painted under the pointer on an otherwise unstyled workspace button.
+const HOVER_BACKGROUND: Color = Color::rgba(0xff, 0xff, 0xff, 0x1f);
 
 /// Cross-thread wakeup; backend phases send this after model updates.
 #[derive(Debug)]
 pub enum BackendEvent {
     Redraw,
+    /// Tray item refused `Activate`; ayatana-style items only offer their menu.
+    OpenTrayMenu(String),
 }
 
 pub fn run(window: Window) -> Result<()> {
@@ -190,10 +197,12 @@ pub fn run(window: Window) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("prime backend channel: {error}"))?;
     event_loop
         .handle()
-        .insert_source(backend_channel, |event, _, state| {
-            if matches!(event, ChannelEvent::Msg(BackendEvent::Redraw)) {
-                state.redraw();
+        .insert_source(backend_channel, |event, _, state| match event {
+            ChannelEvent::Msg(BackendEvent::Redraw) => state.redraw(),
+            ChannelEvent::Msg(BackendEvent::OpenTrayMenu(address)) => {
+                state.show_tray_menu(&address)
             }
+            ChannelEvent::Closed => {}
         })
         .map_err(|error| anyhow::anyhow!("insert backend channel: {error}"))?;
 
@@ -269,6 +278,9 @@ pub fn run(window: Window) -> Result<()> {
         modifiers: Modifiers::default(),
         pointer_position: None,
         hovered: None,
+        pinned: false,
+        hovering: false,
+        collapse_pending: false,
         apps,
         taskbar,
         audio,
@@ -424,21 +436,30 @@ fn expand(
                     } else {
                         (text, Color::TRANSPARENT)
                     };
+                    // Text draws from its own rect's origin, so the label lives in a
+                    // child and the padded parent centres it on both axes.
                     Element {
                         id: Some(format!("ws:{}", ws.id)),
-                        content: Content::Text(Text {
-                            value: workspace_label(labels, index, ws),
-                            ..ws_text.clone()
-                        }),
+                        content: Content::Box,
                         style: Style {
                             corner_radius: 6,
                             ..Style::panel(bg)
                         },
                         width: Size::Fit,
-                        height: Size::Fit,
-                        padding: 7,
+                        height: Size::Grow,
+                        padding: 12,
                         align: Align::Center,
+                        justify: Align::Center,
                         direction: Direction::Row,
+                        children: vec![Element {
+                            content: Content::Text(Text {
+                                value: workspace_label(labels, index, ws),
+                                ..ws_text.clone()
+                            }),
+                            width: Size::Fit,
+                            height: Size::Fit,
+                            ..Element::new(Style::panel(Color::TRANSPARENT))
+                        }],
                         ..Element::new(Style::panel(Color::TRANSPARENT))
                     }
                 })
@@ -624,6 +645,22 @@ fn expand(
     }
 }
 
+/// Collapses every `Reveal` subtree while the panel is shut. Runs before
+/// `expand` so the data-source pass never starts work for a hidden subtree.
+fn reveal(root: &Element, open: bool) -> Element {
+    if matches!(root.content, Content::Reveal) && !open {
+        return hidden(root);
+    }
+    Element {
+        children: root
+            .children
+            .iter()
+            .map(|child| reveal(child, open))
+            .collect(),
+        ..root.clone()
+    }
+}
+
 fn hidden(root: &Element) -> Element {
     Element {
         id: Some(HIDDEN_ID.to_owned()),
@@ -639,13 +676,25 @@ fn is_hidden(element: &Element) -> bool {
     element.id.as_deref() == Some(HIDDEN_ID)
 }
 
+/// Text draws from its own rect's origin, so the label lives in a `Fit` child
+/// that the parent centres on both axes. Keeps the widget's own hit target at
+/// full bar height while the glyphs sit on the centre line.
 fn dynamic_text(root: &Element, id: &str, text: &Text, value: String) -> Element {
     Element {
         id: Some(id.to_owned()),
-        content: Content::Text(Text {
-            value,
-            ..text.clone()
-        }),
+        content: Content::Box,
+        align: Align::Center,
+        justify: Align::Center,
+        direction: Direction::Row,
+        children: vec![Element {
+            content: Content::Text(Text {
+                value,
+                ..text.clone()
+            }),
+            width: Size::Fit,
+            height: Size::Fit,
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        }],
         ..root.clone()
     }
 }
@@ -688,12 +737,29 @@ fn tray_item(item: TrayItem, text: &Text, icon_size: u32) -> Element {
             size: icon_size,
             fallback,
         },
-        width: Size::Fixed(icon_size),
-        height: Size::Fixed(icon_size),
+        // Icons paint centred, so the box is padded out purely to widen the hit target.
+        width: Size::Fixed(icon_size.saturating_add(12)),
+        height: Size::Grow,
         padding: 3,
         align: Align::Center,
         direction: Direction::Row,
         ..Element::new(Style::panel(Color::TRANSPARENT))
+    }
+}
+
+/// Tints the hovered workspace button so the pointer target is visible.
+fn apply_hover(layout: &mut [LayoutItem], hovered: Option<&str>) {
+    let Some(id) = hovered.filter(|id| id.starts_with("ws:")) else {
+        return;
+    };
+    for item in layout
+        .iter_mut()
+        .filter(|item| item.id.as_deref() == Some(id))
+    {
+        // Already-styled buttons (active, urgent) keep their own colour.
+        if item.style.background == Color::TRANSPARENT {
+            item.style.background = HOVER_BACKGROUND;
+        }
     }
 }
 
@@ -1180,6 +1246,11 @@ struct State {
     modifiers: Modifiers,
     pointer_position: Option<(f64, f64)>,
     hovered: Option<String>,
+    /// Panel held open by a click until the next click, independent of hover.
+    pinned: bool,
+    hovering: bool,
+    /// Set while a dwell timer is armed, so re-entry cancels the collapse.
+    collapse_pending: bool,
     apps: Option<Apps>,
     taskbar: Taskbar,
     audio: Option<AudioClient>,
@@ -1247,13 +1318,15 @@ impl State {
         let width = i32::try_from(self.width).context("surface width exceeds Wayland limit")?;
         let height = i32::try_from(self.height).context("surface height exceeds Wayland limit")?;
         let stride = width.checked_mul(4).context("surface stride overflow")?;
+        let open = self.panel_open();
         let (buffer, canvas) = self
             .pool
             .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
             .context("create shared-memory buffer")?;
 
+        let tree = reveal(&self.window.root, open);
         let root = expand(
-            &self.window.root,
+            &tree,
             self.apps.as_ref(),
             &self.taskbar,
             self.audio.as_ref(),
@@ -1268,6 +1341,7 @@ impl State {
         self.layout = element::layout(&root, self.width, self.height, &mut |content| {
             self.text.measure(content)
         });
+        apply_hover(&mut self.layout, self.hovered.as_deref());
         paint::render(
             canvas,
             self.width,
@@ -1297,6 +1371,66 @@ impl State {
         if hovered != self.hovered {
             self.hovered = hovered;
             self.redraw();
+        }
+    }
+
+    /// A panel opens on hover and stays open once pinned by a click.
+    fn panel_open(&self) -> bool {
+        self.window.expanded_height.is_some() && (self.pinned || self.hovering)
+    }
+
+    /// Asks for the height the current panel state wants. The redraw rides the
+    /// resulting `configure`; `exclusive_zone` stays at the collapsed height so
+    /// an open panel overlays other windows instead of reflowing them.
+    fn apply_panel_size(&mut self) {
+        let Some(expanded) = self.window.expanded_height else {
+            return;
+        };
+        let target = if self.panel_open() {
+            expanded
+        } else {
+            self.window.height
+        };
+        if target == self.height {
+            return;
+        }
+        self.layer.set_size(self.window.width, target);
+        self.layer.commit();
+    }
+
+    /// Opens on hover; a leave arms a dwell timer instead of collapsing at
+    /// once, because crossing into the panel's own newly grown area during a
+    /// resize round-trip also delivers a leave.
+    fn set_hovering(&mut self, hovering: bool) {
+        if self.window.expanded_height.is_none() || hovering == self.hovering {
+            return;
+        }
+        if hovering {
+            self.hovering = true;
+            self.collapse_pending = false;
+            self.apply_panel_size();
+            return;
+        }
+        if self.collapse_pending {
+            return;
+        }
+        self.collapse_pending = true;
+        let inserted = self.loop_handle.insert_source(
+            Timer::from_duration(PANEL_DWELL),
+            |_, _, state: &mut Self| {
+                if state.collapse_pending {
+                    state.collapse_pending = false;
+                    state.hovering = false;
+                    state.apply_panel_size();
+                }
+                TimeoutAction::Drop
+            },
+        );
+        if inserted.is_err() {
+            // No timer, no dwell: collapse now rather than latch open forever.
+            self.collapse_pending = false;
+            self.hovering = false;
+            self.apply_panel_size();
         }
     }
 
@@ -1429,9 +1563,21 @@ impl State {
             self.taskbar.activate_workspace(ws_id);
             return;
         }
+        if hit.as_deref().is_some_and(|id| id.starts_with("panel:")) {
+            self.pinned = !self.pinned;
+            self.apply_panel_size();
+            self.redraw();
+            return;
+        }
         if let Some(address) = hit.as_deref().and_then(|id| id.strip_prefix("tray:")) {
-            if let Some(tray) = &self.tray {
-                tray.activate(address.to_owned(), position.0 as i32, position.1 as i32);
+            let address = address.to_owned();
+            // Ayatana items (nm-applet, udiskie, steam) expose no Activate at all, so
+            // their menu is the only left-click affordance. Activate falls back to
+            // BackendEvent::OpenTrayMenu when the call is refused.
+            if self.tray_is_menu(&address) {
+                self.show_tray_menu(&address);
+            } else if let Some(tray) = &self.tray {
+                tray.activate(address, position.0 as i32, position.1 as i32);
             }
             return;
         }
@@ -1569,6 +1715,24 @@ impl State {
         });
         if scrolled {
             self.redraw();
+        }
+    }
+
+    /// True when the item offers only a menu, so left-click must not try Activate.
+    fn tray_is_menu(&self, address: &str) -> bool {
+        self.tray.as_ref().is_some_and(|tray| {
+            tray.snapshot()
+                .items
+                .iter()
+                .any(|item| item.address == address && item.item_is_menu)
+        })
+    }
+
+    /// Opens the tray menu and repaints it, keeping click and fallback paths identical.
+    fn show_tray_menu(&mut self, address: &str) {
+        self.open_menu(address);
+        if self.menu.is_some() {
+            self.redraw_menu();
         }
     }
 
@@ -1983,9 +2147,13 @@ impl PointerHandler for State {
                 continue;
             }
             match event.kind {
-                PointerEventKind::Leave { .. } => self.pointer_position = None,
+                PointerEventKind::Leave { .. } => {
+                    self.pointer_position = None;
+                    self.set_hovering(false);
+                }
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
                     self.pointer_position = Some(event.position);
+                    self.set_hovering(true);
                 }
                 PointerEventKind::Press { button, serial, .. } => {
                     self.last_serial = Some(serial);
@@ -2422,6 +2590,46 @@ mod tests {
         assert!(contains_clock(&root));
     }
 
+    fn workspace_layout(id: &str, background: Color) -> LayoutItem {
+        LayoutItem {
+            id: Some(id.to_owned()),
+            content: Content::Box,
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 30.0,
+                height: 30.0,
+            },
+            style: Style::panel(background),
+        }
+    }
+
+    #[test]
+    fn apply_hover_should_tint_only_the_hovered_plain_workspace() {
+        let active = Color::rgba(0xaa, 0xbb, 0xcc, 0xff);
+        let mut layout = vec![
+            workspace_layout("ws:1", Color::TRANSPARENT),
+            workspace_layout("ws:2", active),
+            workspace_layout("tray:x", Color::TRANSPARENT),
+        ];
+
+        apply_hover(&mut layout, Some("ws:1"));
+
+        assert_eq!(layout[0].style.background, HOVER_BACKGROUND);
+        assert_eq!(layout[1].style.background, active);
+        assert_eq!(layout[2].style.background, Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn apply_hover_should_leave_a_hovered_active_workspace_alone() {
+        let active = Color::rgba(0xaa, 0xbb, 0xcc, 0xff);
+        let mut layout = vec![workspace_layout("ws:2", active)];
+
+        apply_hover(&mut layout, Some("ws:2"));
+
+        assert_eq!(layout[0].style.background, active);
+    }
+
     fn styled(value: &str) -> Text {
         Text {
             value: value.to_owned(),
@@ -2584,7 +2792,8 @@ mod tests {
         let rendered = expanded
             .children
             .iter()
-            .map(|child| match &child.content {
+            .flat_map(|child| &child.children)
+            .map(|label| match &label.content {
                 Content::Text(text) => text.value.clone(),
                 _ => String::new(),
             })
@@ -2592,9 +2801,78 @@ mod tests {
         assert_eq!(rendered, ["1", "2"]);
     }
 
+    fn panel(children: Vec<Element>) -> Element {
+        Element {
+            id: Some("panel:main".to_owned()),
+            content: Content::Reveal,
+            children,
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        }
+    }
+
     #[test]
-    fn expand_should_hide_wrappers_emptied_by_dynamic_children() {
-        let child = Element {
+    fn reveal_should_collapse_only_while_shut() {
+        let tree = panel(vec![Element::new(Style::panel(Color::TRANSPARENT))]);
+
+        let shut = reveal(&tree, false);
+        assert!(is_hidden(&shut));
+        assert!(shut.children.is_empty());
+
+        let open = reveal(&tree, true);
+        assert!(!is_hidden(&open));
+        assert_eq!(open.children.len(), 1);
+    }
+
+    #[test]
+    fn reveal_should_nest_without_disturbing_its_parent() {
+        let tree = Element {
+            children: vec![
+                Element {
+                    id: Some("clock".to_owned()),
+                    ..Element::new(Style::panel(Color::TRANSPARENT))
+                },
+                panel(Vec::new()),
+            ],
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        };
+
+        let shut = reveal(&tree, false);
+
+        assert!(!is_hidden(&shut));
+        assert_eq!(shut.children.len(), 2);
+        assert!(!is_hidden(&shut.children[0]));
+        assert!(is_hidden(&shut.children[1]));
+    }
+
+    #[test]
+    fn reveal_should_survive_a_bar_with_no_other_children() {
+        // `expand`'s default arm hides a parent whose children all hid, so a bar
+        // holding only a shut panel must not take the whole surface down with it.
+        let tree = Element {
+            children: vec![panel(Vec::new())],
+            ..Element::new(Style::panel(Color::TRANSPARENT))
+        };
+        let taskbar = Taskbar::default();
+
+        let expanded = expand(
+            &reveal(&tree, false),
+            None,
+            &taskbar,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+        );
+
+        assert!(is_hidden(&expanded), "documented collapse, pinned by test");
+    }
+
+    #[test]
+    fn expand_should_hide_wrappers_emptied_by_dynamic_children() {        let child = Element {
             content: Content::Battery {
                 text: styled("battery"),
                 format: "{capacity}%".to_owned(),
@@ -2852,6 +3130,10 @@ mod tests {
             expanded_ws.children[0].style.background,
             Color::rgba(0xff, 0xff, 0xff, 0x44)
         );
+        let Content::Text(label) = &expanded_ws.children[0].children[0].content else {
+            panic!("workspace button should hold its label in a centred child");
+        };
+        assert_eq!(label.value, "1");
     }
 
     #[test]

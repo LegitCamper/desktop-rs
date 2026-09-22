@@ -36,6 +36,7 @@ fn engine() -> NbclEngine {
     let mut engine = NbclEngine::new();
     for type_name in COMPONENTS.iter().copied().chain([
         "Box",
+        "Reveal",
         "Text",
         "Clock",
         "AppSearch",
@@ -90,6 +91,7 @@ fn window(node: &ResolvedNode, base: Window) -> Result<Window> {
     Ok(Window {
         width: opt(props, "width", int_u32)?.unwrap_or(base.width),
         height: opt(props, "height", int_u32)?.unwrap_or(base.height),
+        expanded_height: opt(props, "expanded_height", int_u32)?.or(base.expanded_height),
         layer: opt(props, "layer", layer)?.unwrap_or(base.layer),
         anchor: opt(props, "anchor", anchor)?.unwrap_or(base.anchor),
         margin: opt(props, "margin", margin)?.unwrap_or(base.margin),
@@ -112,6 +114,7 @@ fn element(node: &ResolvedNode, fallback: Style) -> Result<Element> {
         align: opt(props, "text_align", align)?.unwrap_or(Align::Start),
     };
     let content = match node.type_name.as_str() {
+        "Reveal" => Content::Reveal,
         "Text" => Content::Text(text_style),
         "AppSearch" => Content::AppSearch {
             text: text_style.clone(),
@@ -421,6 +424,20 @@ mod tests {
 
     use super::*;
 
+    /// Widgets live in the bar's row, one level under the column root that also
+    /// holds the `Reveal` panel. Tests inject new widgets at the same depth.
+    const WIDGET_ANCHOR: &str = "        Audio {";
+
+    fn bar_row(windows: &HashMap<String, Window>) -> Result<&Element> {
+        windows
+            .get("bar")
+            .context("config defines no bar")?
+            .root
+            .children
+            .first()
+            .context("bar defines no widget row")
+    }
+
     fn evaluate(source: &str) -> Result<HashMap<String, Window>> {
         evaluate_at(
             source,
@@ -464,11 +481,20 @@ mod tests {
     fn default_config_should_build_the_bar_children() -> Result<()> {
         let windows = evaluate(paths::DEFAULT_CONFIG)?;
         let bar = windows.get("bar").context("config defines no bar")?;
+        let row = bar_row(&windows)?;
 
-        assert_eq!(bar.root.children.len(), 9);
-        assert_eq!(bar.root.children[0].width, Size::Fit);
-        assert_eq!(bar.root.children[1].width, Size::Grow);
+        assert_eq!(row.children.len(), 9);
+        assert_eq!(row.children[0].width, Size::Fit);
+        assert_eq!(row.children[1].width, Size::Grow);
         assert_eq!(bar.exclusive_zone, 40);
+        assert_eq!(bar.expanded_height, Some(320));
+        assert!(
+            bar.root
+                .children
+                .iter()
+                .any(|child| child.content == Content::Reveal),
+            "the bundled bar ships a hover panel"
+        );
         Ok(())
     }
 
@@ -509,8 +535,8 @@ mod tests {
     #[test]
     fn custom_should_require_a_unique_node_id() {
         let source = paths::DEFAULT_CONFIG.replace(
-            "    Audio {",
-            "    Custom { exec = \"printf ok\" }\n    Audio {",
+            WIDGET_ANCHOR,
+            "        Custom { exec = \"printf ok\" }\n        Audio {",
         );
 
         let Err(error) = evaluate(&source) else {
@@ -523,13 +549,13 @@ mod tests {
     #[test]
     fn current_dynamic_widget_subset_should_parse() -> Result<()> {
         let source = paths::DEFAULT_CONFIG.replace(
-            "    Audio {",
-            "    Battery { width = \"fit\" format = \"{capacity}% {status}\" }\n    Backlight { width = \"fit\" }\n    Network { width = \"fit\" interval = 3 }\n    Bluetooth { width = \"fit\" }\n    Custom \"kernel\" { width = \"fit\" exec = \"uname -r\" interval = 60 on_click = \"true\" }\n    Audio { target = \"source\" format = \"{icon} {volume}%\" icon = \"MIC\" muted_icon = \"MIC OFF\"",
+            WIDGET_ANCHOR,
+            "        Battery { width = \"fit\" format = \"{capacity}% {status}\" }\n        Backlight { width = \"fit\" }\n        Network { width = \"fit\" interval = 3 }\n        Bluetooth { width = \"fit\" }\n        Custom \"kernel\" { width = \"fit\" exec = \"uname -r\" interval = 60 on_click = \"true\" }\n        Audio { target = \"source\" format = \"{icon} {volume}%\" icon = \"MIC\" muted_icon = \"MIC OFF\"",
         );
 
         let windows = evaluate(&source)?;
 
-        assert_eq!(windows.get("bar").context("bar")?.root.children.len(), 14);
+        assert_eq!(bar_row(&windows)?.children.len(), 14);
         Ok(())
     }
 
@@ -563,14 +589,11 @@ mod tests {
     #[test]
     fn icon_should_keep_theme_path_and_icon_theme_separate() -> Result<()> {
         let source = paths::DEFAULT_CONFIG.replace(
-            "    Audio {",
-            "    Icon { width = \"fit\" name = \"utilities-terminal\" icon_size = 32 icon_theme = \"Papirus\" }\n    Audio {",
+            WIDGET_ANCHOR,
+            "        Icon { width = \"fit\" name = \"utilities-terminal\" icon_size = 32 icon_theme = \"Papirus\" }\n        Audio {",
         );
         let windows = evaluate(&source)?;
-        let icon = windows
-            .get("bar")
-            .context("bar")?
-            .root
+        let icon = bar_row(&windows)?
             .children
             .iter()
             .find(|element| matches!(element.content, Content::Icon { .. }))

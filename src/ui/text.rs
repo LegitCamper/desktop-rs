@@ -56,9 +56,13 @@ impl TextRenderer {
         if rect.width <= 0.0 || rect.height <= 0.0 {
             return Ok(());
         }
-        let mut buffer = self.buffer(&text, Some(rect.width), Some(rect.height));
+        // The full line box drives both shaping and centring. Clamping it to a
+        // shorter rect would shape against metrics it then ignores, pinning the
+        // glyphs to the top edge; overflow is centred symmetrically instead.
+        let text_height = line_height(text.font_size);
+        let mut buffer = self.buffer(&text, Some(rect.width), Some(text_height));
         let x_origin = rect.x.floor() as i32;
-        let y_origin = rect.y.floor() as i32;
+        let y_origin = centered_y(rect, text_height);
         buffer.draw(
             &mut self.fonts,
             &mut self.glyphs,
@@ -117,6 +121,7 @@ fn resolved_text(content: &Content) -> Result<Option<Text>> {
     match content {
         Content::Icon { fallback, .. } => Ok(Some(fallback.clone())),
         Content::Box
+        | Content::Reveal
         | Content::AppSearch { .. }
         | Content::AppList { .. }
         | Content::ActiveWindow { .. }
@@ -147,6 +152,10 @@ pub fn validate_clock_format(format: &str) -> Result<()> {
 /// Text row height for a font size; matches the renderer's line metrics.
 pub const fn line_height(font_size: u32) -> f32 {
     font_size as f32 * 1.25
+}
+
+fn centered_y(rect: Rect, text_height: f32) -> i32 {
+    (rect.y + (rect.height - text_height) / 2.0).floor() as i32
 }
 
 fn composite(canvas: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: CosmicColor) {
@@ -198,6 +207,32 @@ mod tests {
             premultiply(Color::rgba(0xff, 0x80, 0x40, 0x80)),
             [0x20, 0x40, 0x80, 0x80]
         );
+    }
+
+    #[test]
+    fn centered_y_should_put_a_text_line_in_the_middle() {
+        let rect = Rect {
+            x: 0.0,
+            y: 10.0,
+            width: 100.0,
+            height: 40.0,
+        };
+
+        assert_eq!(centered_y(rect, 20.0), 20);
+    }
+
+    #[test]
+    fn centered_y_should_split_overflow_instead_of_pinning_to_the_top() {
+        // A line taller than its rect used to be clamped to the rect height,
+        // which zeroed the offset and left the glyphs riding the top edge.
+        let rect = Rect {
+            x: 0.0,
+            y: 10.0,
+            width: 100.0,
+            height: 16.0,
+        };
+
+        assert_eq!(centered_y(rect, 20.0), 8);
     }
 
     #[test]

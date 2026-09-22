@@ -33,6 +33,9 @@ pub struct Window {
     pub anchor: Anchor,
     pub width: u32,
     pub height: u32,
+    /// Height the surface grows to while a `Reveal` panel is open. `None`
+    /// leaves the surface fixed and every `Reveal` permanently collapsed.
+    pub expanded_height: Option<u32>,
     pub margin: Margin,
     /// Screen space reserved from other windows. `-1` opts out of reservation.
     pub exclusive_zone: i32,
@@ -56,6 +59,7 @@ impl Window {
             anchor: Anchor::TOP | Anchor::LEFT | Anchor::RIGHT,
             width: 0,
             height,
+            expanded_height: None,
             margin: Margin::default(),
             exclusive_zone: height as i32,
             keyboard_interactivity: KeyboardInteractivity::None,
@@ -72,7 +76,7 @@ impl Window {
             anchor: Anchor::TOP | Anchor::RIGHT,
             width: 380,
             height: 96,
-            margin: Margin {
+            expanded_height: None,            margin: Margin {
                 top: 48,
                 right: 12,
                 bottom: 0,
@@ -93,6 +97,7 @@ impl Window {
             anchor: Anchor::empty(),
             width: 640,
             height: 320,
+            expanded_height: None,
             margin: Margin::uniform(0),
             exclusive_zone: -1,
             keyboard_interactivity: KeyboardInteractivity::Exclusive,

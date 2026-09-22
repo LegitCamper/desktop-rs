@@ -117,7 +117,7 @@ Each exports `base`, `surface`, `text`, `muted`, `accent`, `warning`, `error`, a
 
 ## NBCL elements
 
-[NBCL](https://nbcl-lang.github.io/docs) defines all three required surfaces: `Bar`, `Notification`, and `Launcher`. Supported child nodes: `Box`, `Text`, `Icon`, `Clock`, `Workspaces`, `ActiveWindow`, `Audio`, `Battery`, `Backlight`, `Network`, `Bluetooth`, named `Custom`, `Tray`, `AppSearch`, and `AppList`.
+[NBCL](https://nbcl-lang.github.io/docs) defines all three required surfaces: `Bar`, `Notification`, and `Launcher`. Supported child nodes: `Box`, `Reveal`, `Text`, `Icon`, `Clock`, `Workspaces`, `ActiveWindow`, `Audio`, `Battery`, `Backlight`, `Network`, `Bluetooth`, named `Custom`, `Tray`, `AppSearch`, and `AppList`.
 
 ```nbcl
 Bar {
@@ -165,6 +165,26 @@ Layout properties:
 - `align`, `text_align`: `"start"`, `"center"`, or `"end"`
 - `justify`: `"start"`, `"center"`, or `"end"`; distributes leftover main-axis space, ignored once any child is `"grow"`
 - `padding`, `gap`: non-negative integer pixels
+
+Hover panels:
+
+`Reveal` renders its children only while the surface's panel is open, so a bar can hold views that do not fit on one line. Set `expanded_height` on the surface to the height it grows to; without it every `Reveal` stays collapsed. Pointing at the surface opens the panel and leaving it collapses after a short dwell; give the node an id starting with `panel:` and a click pins it open until the next click. `exclusive_zone` is not touched while open, so an open panel overlays other windows rather than reflowing them.
+
+```nbcl
+Bar {
+    height = 40
+    expanded_height = 320
+    direction = "column"
+
+    Box { height = 40 Clock { width = "fit" format = "%H:%M" } }
+    Reveal "panel:main" {
+        height = "grow"
+        background = theme.surface
+        padding = 16
+        Clock { height = "fit" format = "%A, %B %-d" font_size = 28 }
+    }
+}
+```
 
 Text properties:
 

@@ -13,88 +13,129 @@ component Pill (any: props) {
 }
 
 Bar {
-    height         = 40
-    anchor         = ["top", "left", "right"]
-    layer          = "top"
-    exclusive_zone = 40
-    background     = theme.base
-    padding        = 6
-    gap            = 8
-    align          = "center"
+    height          = 40
+    expanded_height = 320
+    anchor          = ["top", "left", "right"]
+    layer           = "top"
+    exclusive_zone  = 40
+    background      = theme.base
+    padding         = 0
+    gap             = 0
+    direction       = "column"
 
-    Pill {
-        width = "fit"
-        Workspaces {
-            width             = "fit"
-            color             = theme.text
-            active_color      = theme.accent
-            active_background = theme.surface
-            urgent_color      = theme.error
-            font_size         = 14
-            gap               = 4
+    Box {
+        height  = 40
+        padding = 6
+        gap     = 8
+        align   = "center"
+
+        Pill {
+            width = "fit"
+            Workspaces {
+                width             = "fit"
+                color             = theme.text
+                active_color      = theme.accent
+                active_background = theme.surface
+                urgent_color      = theme.error
+                font_size         = 14
+                gap               = 4
+            }
+        }
+        ActiveWindow {
+            width       = "grow"
+            color       = theme.text
+            font_size   = 14
+            text_align  = "center"
+            max_chars   = 60
+            empty_value = "desktop-rs"
+        }
+        Tray {
+            width     = "fit"
+            color     = theme.text
+            font_size = 12
+            icon_size = 20
+            gap       = 4
+        }
+        Audio {
+            width      = "fit"
+            target     = "sink"
+            format     = "{icon} {volume}%"
+            icon       = "VOL"
+            muted_icon = "MUTED"
+            color      = theme.text
+            font_size  = 14
+            step       = 5
+            max_volume = 100
+        }
+        Battery {
+            width     = "fit"
+            format    = "{icon} {capacity}%"
+            icon      = "BAT"
+            color     = theme.text
+            font_size = 14
+        }
+        Backlight {
+            width     = "fit"
+            format    = "{icon} {percent}%"
+            icon      = "BRT"
+            color     = theme.text
+            font_size = 14
+        }
+        Network {
+            width               = "fit"
+            format              = "{iface} {ssid} {signal}% {ipv4}/{prefix}"
+            disconnected_format = "disconnected"
+            interval            = 5
+            color               = theme.text
+            font_size           = 14
+        }
+        Bluetooth {
+            width     = "fit"
+            format    = "BT {connected}"
+            interval  = 5
+            color     = theme.text
+            font_size = 14
+        }
+        Clock {
+            width      = "fit"
+            format     = "%a %b %-d  %H:%M:%S"
+            color      = theme.text
+            font_size  = 14
+            text_align = "end"
         }
     }
-    ActiveWindow {
-        width       = "grow"
-        color       = theme.text
-        font_size   = 14
-        text_align  = "center"
-        max_chars   = 60
-        empty_value = "desktop-rs"
-    }
-    Tray {
-        width     = "fit"
-        color     = theme.text
-        font_size = 12
-        icon_size = 20
-        gap       = 4
-    }
-    Audio {
-        width      = "fit"
-        target     = "sink"
-        format     = "{icon} {volume}%"
-        icon       = "VOL"
-        muted_icon = "MUTED"
-        color      = theme.text
-        font_size  = 14
-        step       = 5
-        max_volume = 100
-    }
-    Battery {
-        width     = "fit"
-        format    = "{icon} {capacity}%"
-        icon      = "BAT"
-        color     = theme.text
-        font_size = 14
-    }
-    Backlight {
-        width     = "fit"
-        format    = "{icon} {percent}%"
-        icon      = "BRT"
-        color     = theme.text
-        font_size = 14
-    }
-    Network {
-        width               = "fit"
-        format              = "{iface} {ssid} {signal}% {ipv4}/{prefix}"
-        disconnected_format = "disconnected"
-        interval            = 5
-        color               = theme.text
-        font_size           = 14
-    }
-    Bluetooth {
-        width     = "fit"
-        format    = "BT {connected}"
-        interval  = 5
-        color     = theme.text
-        font_size = 14
-    }
-    Clock {
-        width      = "fit"
-        format     = "%a %b %-d  %H:%M:%S"
-        color      = theme.text
-        font_size  = 14
-        text_align = "end"
+
+    # Drops down on hover; click it to pin it open. Holds any widget the bar can.
+    Reveal "panel:main" {
+        height     = "grow"
+        background = theme.surface
+        padding    = 16
+        gap        = 12
+        direction  = "column"
+
+        Clock {
+            height     = "fit"
+            format     = "%A, %B %-d"
+            color      = theme.text
+            font_size  = 28
+            text_align = "center"
+        }
+        Network {
+            height              = "fit"
+            format              = "{iface}  {ssid}  {signal}%  {ipv4}/{prefix}"
+            disconnected_format = "no network"
+            interval            = 5
+            color               = theme.muted
+            font_size           = 14
+            text_align          = "center"
+        }
+        Battery {
+            height     = "fit"
+            format     = "battery {capacity}% {status}"
+            color      = theme.muted
+            font_size  = 14
+            text_align = "center"
+        }
     }
 }
 

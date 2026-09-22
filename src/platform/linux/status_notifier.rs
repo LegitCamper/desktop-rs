@@ -362,8 +362,19 @@ async fn run_connection(
                 let Some(command) = command else {
                     return Ok(());
                 };
+                let fallback = match &command {
+                    TrayCommand::Activate { address, .. } => Some(address.clone()),
+                    _ => None,
+                };
                 if let Err(error) = activate(&client, &connection, command).await {
-                    eprintln!("activate status notifier item: {error:#}");
+                    // Ayatana items implement no Activate method; their menu is the
+                    // only left-click affordance, so hand the UI thread the popup.
+                    match fallback {
+                        Some(address) => {
+                            let _ = backend_sender.send(BackendEvent::OpenTrayMenu(address));
+                        }
+                        None => eprintln!("activate status notifier item: {error:#}"),
+                    }
                 }
             }
         }
