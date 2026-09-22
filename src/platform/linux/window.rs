@@ -76,7 +76,8 @@ impl Window {
             anchor: Anchor::TOP | Anchor::RIGHT,
             width: 380,
             height: 96,
-            expanded_height: None,            margin: Margin {
+            expanded_height: None,
+            margin: Margin {
                 top: 48,
                 right: 12,
                 bottom: 0,

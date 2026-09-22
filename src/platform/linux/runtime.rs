@@ -2872,7 +2872,8 @@ mod tests {
     }
 
     #[test]
-    fn expand_should_hide_wrappers_emptied_by_dynamic_children() {        let child = Element {
+    fn expand_should_hide_wrappers_emptied_by_dynamic_children() {
+        let child = Element {
             content: Content::Battery {
                 text: styled("battery"),
                 format: "{capacity}%".to_owned(),
