@@ -343,7 +343,24 @@ fn place(
     }
 }
 
+/// Size a parent must reserve for this element. A `Fixed` axis reports what it
+/// declares, because that is what `place` will hand it; measuring its content
+/// instead leaves a `Fit` parent too small and its children overflow.
 fn natural_size(element: &Element, measure: &mut impl FnMut(&Content) -> (u32, u32)) -> (u32, u32) {
+    let (width, height) = content_size(element, measure);
+    (
+        match element.width {
+            Size::Fixed(value) => value,
+            Size::Grow | Size::Fit => width,
+        },
+        match element.height {
+            Size::Fixed(value) => value,
+            Size::Grow | Size::Fit => height,
+        },
+    )
+}
+
+fn content_size(element: &Element, measure: &mut impl FnMut(&Content) -> (u32, u32)) -> (u32, u32) {
     let own = measure(&element.content);
     let padding = element.padding.saturating_mul(2);
     if element.children.is_empty() {
@@ -468,6 +485,33 @@ mod tests {
         let items = layout(&tree, 100, 30, &mut |_| (20, 12));
 
         assert_eq!(items[1].rect.width, 38.0);
+    }
+
+    #[test]
+    fn fit_parent_should_reserve_its_fixed_children_declared_width() {
+        // A Fit container used to measure Fixed children by their content, so it
+        // ended up narrower than the space `place` hands them and the children
+        // spilled out over whatever sat next to it.
+        let tree = row(
+            vec![Element {
+                width: Size::Fit,
+                children: vec![
+                    leaf(Size::Fixed(32)),
+                    Element {
+                        width: Size::Fixed(32),
+                        ..Element::new(Style::panel(BG))
+                    },
+                ],
+                ..Element::new(Style::panel(BG))
+            }],
+            0,
+            0,
+        );
+
+        let items = layout(&tree, 200, 30, &mut |_| (10, 12));
+
+        assert_eq!(items[1].rect.width, 64.0);
+        assert_eq!(items[3].rect.x, 32.0);
     }
 
     #[test]
